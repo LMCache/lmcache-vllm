@@ -103,7 +103,7 @@ class LMCVLLMDriver:
             loaded_block_nums: the block idx of the blocks that are being injected.
                                Can be an empty list if nothing is injected
         """
-        loaded_kv, loaded_kv_len = self.cache_engine.retrive(torch.tensor(token_ids), "vllm", self.device)
+        loaded_kv, loaded_kv_len = self.cache_engine.retrive(torch.tensor(token_ids), self.device)
         if loaded_kv_len > self.block_size: # skip if less than a single block
             loaded_block_nums = self._inject_kv_cache(kv_caches, loaded_kv, loaded_kv_len, block_table)
             return loaded_block_nums
@@ -147,7 +147,7 @@ class LMCVLLMDriver:
             k = k_cache.permute([0, 3, 1, 2, 4]).reshape(-1, num_kv_heads, head_size)[slot_mapping]
             rebuilt_kv_cache.append((k, v))
 
-        self.cache_engine.store(token_ids, rebuilt_kv_cache, "vllm")
+        self.cache_engine.store(token_ids, rebuilt_kv_cache)
 
     def retrive(
             self,
