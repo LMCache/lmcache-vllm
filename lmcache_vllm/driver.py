@@ -147,7 +147,7 @@ class LMCVLLMDriver:
             k = k_cache.permute([0, 3, 1, 2, 4]).reshape(-1, num_kv_heads, head_size)[slot_mapping]
             rebuilt_kv_cache.append((k, v))
 
-        self.cache_engine.store(token_ids, rebuilt_kv_cache)
+        self.cache_engine.store(token_ids, rebuilt_kv_cache, blocking = False)
 
     def retrive(
             self,
