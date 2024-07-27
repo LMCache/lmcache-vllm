@@ -139,14 +139,23 @@ class LMCVLLMDriver:
         st, ed = attn_metadata.prefill_metadata.subquery_start_loc[idx:idx+2]
         slot_mapping[context_length:] = attn_metadata.slot_mapping[st:ed]
 
-        rebuilt_kv_cache = []
+        #rebuilt_kv_cache = []
+        rebuilt_k_caches = []
+        rebuilt_v_caches = []
         # FIXME: the following code is not really readable
         for kv_layer in kv_caches:
             k_cache, v_cache = PagedAttention.split_kv_cache(kv_layer, num_kv_heads, head_size)
             v = v_cache.permute([0, 3, 1, 2]).reshape(-1, num_kv_heads, head_size)[slot_mapping]
             k = k_cache.permute([0, 3, 1, 2, 4]).reshape(-1, num_kv_heads, head_size)[slot_mapping]
-            rebuilt_kv_cache.append((k, v))
-
+            #rebuilt_kv_cache.append((k, v))
+            rebuilt_k_caches.append(k)
+            rebuilt_v_caches.append(v)
+        rebuilt_k_cache = torch.stack(rebuilt_k_caches)
+        rebuilt_v_cache = torch.stack(rebuilt_v_caches)
+        
+        # rebuilt_kv_cache: [num_layer, 2, num_tok, num_kv_head, head_size]
+        rebuilt_kv_cache = torch.stack((rebuilt_k_cache, rebuilt_v_cache))
+        rebuilt_kv_cache = rebuilt_kv_cache.permute([1, 0, 2, 3, 4])
         self.cache_engine.store(token_ids, rebuilt_kv_cache, blocking = False)
 
     def retrive(
