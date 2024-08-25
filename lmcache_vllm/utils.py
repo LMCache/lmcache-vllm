@@ -1,9 +1,11 @@
 from typing import List, Tuple, Any
 import torch
-from vllm.distributed import broadcast_object_list, broadcast
-from vllm.sequence import SequenceGroupMetadata
+#from vllm.distributed import broadcast_object_list, broadcast
+#from vllm.sequence import SequenceGroupMetadata
 
+#FIXME(Jiayi): The following code should be adapted to the latest vllm
 
+'''
 def broadcast_list(
         is_driver_worker: bool,
         lis: List[Any],
@@ -72,3 +74,4 @@ def broadcast_tokens_and_block_tables(
         return ret
     else:
         return broadcast_list(is_driver_worker, ret, device)
+'''
