@@ -1,12 +1,7 @@
 from typing import List, Tuple, Any
+from itertools import chain
 import torch
-'''
-from vllm.attention import AttentionMetadata
-from vllm.attention.ops.paged_attn import PagedAttention
-import vllm._custom_ops as ops
-from vllm.config import ModelConfig, ParallelConfig
-from vllm.sequence import SequenceGroupMetadata
-'''
+
 from lmcache.cache_engine import LMCacheEngine
 from lmcache.logging import init_logger
 
@@ -17,6 +12,81 @@ logger = init_logger(__name__)
 # Use this tag for all lmcache/disagg prefill logic
 DISTRIBUTED_KV_GLOO_TAG = 24857323
 
+# FIXME(Jiayi): sometimes the kv might be 8-bit while hidden_states is 16-bit
+
+class Transport:
+    def __init__(self, comm_config):
+        # TODO(Jiayi): initialize the commuication here    
+        self.backend = comm_config.get("backend")
+        self.world_size =comm_config.get("world_size")
+        self.lmc_rank =comm_config.get("lmc_rank")
+        self.distributed_init_method = comm_config.get("distributed_init_method")
+        self.target_rank_for_recv = comm_config.get("target_rank_for_recv")
+        self.target_rank_for_send = comm_config.get("target_rank_for_send")
+        self.device = torch.device("cpu")
+        torch.distributed.init_process_group(
+            backend=self.backend,
+            init_method=self.distributed_init_method,
+            world_size=self.world_size,
+            rank=self.lmc_rank)
+        
+        # FIXME(Jiayi): remove this hardcode
+        # TODO(Jiayi): TP/PP/World should be passed in as params
+        ranks = [0]
+        self.device_group_world = torch.distributed.new_group(ranks, backend=self.backend)
+        self.cpu_group_world = torch.distributed.new_group(ranks, backend="gloo")
+        
+        self.device_group_TP = torch.distributed.new_group(ranks, backend=self.backend)
+        self.cpu_group_TP = torch.distributed.new_group(ranks, backend="gloo")
+        
+        self.device_group_PP = torch.distributed.new_group(ranks, backend=self.backend)
+        self.cpu_group_PP = torch.distributed.new_group(ranks, backend="gloo")
+        
+        # FIXME(Jiayi): remove this hardcode
+        ranks = [0, 1]
+        self.device_group = torch.distributed.new_group(ranks, backend=self.backend)
+        self.cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+    
+    def send(self, t: torch.Tensor):
+        torch.distributed.send(
+            t,
+            self.target_rank_for_send,
+            self.cpu_group,
+            tag=DISTRIBUTED_KV_GLOO_TAG)
+    
+    def recv(self, size: Tuple, dtype: torch.dtype):
+        buffer = torch.empty(size, dtype=dtype)
+        torch.distributed.recv(
+            t,
+            self.target_rank_for_recv,
+            self.cpu_group,
+            tag=DISTRIBUTED_KV_GLOO_TAG)
+        return t
+    
+    
+    def send_object(self, obj):
+        # Serialize object to tensor and get the size as well
+        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+        size_tensor = torch.tensor([object_tensor.numel()],
+                                   dtype=torch.long,
+                                   device="cpu")
+        # Send object size
+        self.send(size_tensor)
+
+        # Send object
+        self.send(object_tensor)
+        
+    def recv_object(self) -> Any:
+        # Receive object size
+        rank_size = self.recv((1), dtype=torch.long)
+        rank_size = rank_size.item()
+        
+        # Tensor to receive serialized objects into.
+        object_tensor = self.recv(rank_size, dtype=torch.uint8)
+
+        obj = pickle.loads(object_tensor.numpy().tobytes())
+        return obj
+    
 class LMCVLLMDriver_V2:
     def __init__(
         self,
@@ -35,108 +105,23 @@ class LMCVLLMDriver_V2:
             self.dtype = torch.float16
         self.hidden_size = vllm_config.get("hidden_size")
         
-        # communication configs
-        self.backend = comm_config.get("backend")
-        self.world_size =comm_config.get("world_size")
-        self.lmc_rank =comm_config.get("lmc_rank")
-        self.distributed_init_method = comm_config.get("distributed_init_method")
-        self.target_rank_for_recv = comm_config.get("target_rank_for_recv")
-        self.target_rank_for_send = comm_config.get("target_rank_for_send")
-        self.device = torch.device("cpu")
-        torch.distributed.init_process_group(
-            backend=self.backend,
-            init_method=self.distributed_init_method,
-            world_size=self.world_size,
-            rank=self.lmc_rank)
-        
-        # FIXME(Jiayi): remove this hardcode
-        ranks = [0]
-        self.device_group_world = torch.distributed.new_group(ranks, backend=self.backend)
-        self.cpu_group_world = torch.distributed.new_group(ranks, backend="gloo")
-        
-        self.device_group_TP = torch.distributed.new_group(ranks, backend=self.backend)
-        self.cpu_group_TP = torch.distributed.new_group(ranks, backend="gloo")
-        
-        self.device_group_PP = torch.distributed.new_group(ranks, backend=self.backend)
-        self.cpu_group_PP = torch.distributed.new_group(ranks, backend="gloo")
-        
-        # FIXME(Jiayi): remove this hardcode
-        ranks = [0, 1]
-        self.device_group = torch.distributed.new_group(ranks, backend=self.backend)
-        self.cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+        # initialize transport layer
+        self.transport = Transport(comm_config)
         
         # lmc cache engine
         self.cache_engine = cache_engine
         
         # others
-
         logger.info("LMCache driver initialized!!!")
-    
-    def send_object(self, obj):
-
-        # Serialize object to tensor and get the size as well
-        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
-
-        size_tensor = torch.tensor([object_tensor.numel()],
-                                   dtype=torch.long,
-                                   device="cpu")
-
-        # Send object size
-        torch.distributed.send(size_tensor,
-                               dst=self.target_rank_for_send, 
-                               group=self.cpu_group)
-
-        # Send object
-        torch.distributed.send(object_tensor,
-                               dst=self.target_rank_for_send, 
-                               group=self.cpu_group)
-
-        return None
-
-    def recv_object(self) -> Any:
-
-        size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
-
-        # Receive object size
-        rank_size = torch.distributed.recv(size_tensor,
-                                           src=self.target_rank_for_recv,
-                                           group=self.cpu_group)
-
-        # Tensor to receive serialized objects into.
-        object_tensor = torch.empty(  # type: ignore[call-overload]
-            size_tensor.item(),  # type: ignore[arg-type]
-            dtype=torch.uint8,
-            device="cpu")
-
-        rank_object = torch.distributed.recv(object_tensor,
-                                             src=self.target_rank_for_recv,
-                                             group=self.cpu_group)
-
-        obj = pickle.loads(object_tensor.numpy().tobytes())
-
-        return obj
-
-    
-    def recv_kv_start(
-        self,
-    ):
         
-        null_size_tensor = torch.tensor([1,1])
-        torch.distributed.send(
-            null_size_tensor,
-            self.target_rank_for_send,
-            self.cpu_group,
-            tag=DISTRIBUTED_KV_GLOO_TAG)
-        logger.debug(f"Sending null size tensor done")
         
-        null_token_ids_list_tensor = torch.tensor([[-1]])
-        torch.distributed.send(
-            null_token_ids_list_tensor,
-            self.target_rank_for_send,
-            self.cpu_group,
-            tag=DISTRIBUTED_KV_GLOO_TAG)
-        logger.debug(f"Sending null token_ids_list tensor done")
-    
+        # Meta
+        #meta = {
+        #    token_ids: List[torch.Tensor],
+        #    layer_range: List[List[Tuple]],
+        #    token_range: List[List[Tuple]],
+        #    head_range: List[List[Tuple]],
+        #}
 
         
        
@@ -145,194 +130,117 @@ class LMCVLLMDriver_V2:
     ):
             
         # ping vllm to kick off kv cache transfer
-        self.recv_kv_start()
+        null_meta = {
+            "token_ids": -1,
+        }
+        self.transport.send_object(null_meta)
         
+        # get metadata from vllm
+        meta = self.transport.recv_object()
+        num_req = len(meta["token_ids"])
+        logger.debug(f"receiving request...")
         
-        while True:
-            logger.debug(f"receiving request...")
+        for req_idx in range(num_req):
             
-            #FIXME(Jiayi): missing an end signal handler here
-            # Receive num computed token tensor
-            num_computed_token_tensor = torch.tensor([0])
-            torch.distributed.recv(
-                num_computed_token_tensor,
-                self.target_rank_for_recv,
-                self.cpu_group,
-                tag=DISTRIBUTED_KV_GLOO_TAG)
-            num_computed_token = num_computed_token_tensor.item()
+            # FIXME(Jiayi): need to put all info (e.g., layer indices) into lmcache key
+            token_tensor = meta["token_ids"][req_idx]
+            layer_range = meta["layer_range"][req_idx]
+            head_range = meta["head_range"][req_idx]
+            layer_indices = []
+            head_indices = []
+            for idx in range(len(layer_range)):
+                layer_indices.extend([i for i in range(layer_range[idx][0], layer_range[idx][1])])
+                head_indices.extend([i for i in range(head_range[idx][0], head_range[idx][1])])
+            # Here, we assume the KV of all tokens are recieved
+            num_tok = len(token_tensor)
             
-            # handling end signal
-            if num_computed_token == -1:
-                logger.debug(f"received end signal, exiting recv")
-                break
-            
-            # Receive num token tensor
-            num_token_tensor = torch.tensor([0])
-            torch.distributed.recv(
-                num_token_tensor,
-                self.target_rank_for_recv,
-                self.cpu_group,
-                tag=DISTRIBUTED_KV_GLOO_TAG)
-            num_token = num_token_tensor.item()
-            
-            # Receive token tensor
-            token_tensor = torch.empty((num_token,), dtype=torch.long)
-            torch.distributed.recv(
-                token_tensor,
-                self.target_rank_for_recv,
-                self.cpu_group,
-                tag=DISTRIBUTED_KV_GLOO_TAG)
-            #print(token_tensor)
-            #token_ids = token_tensor.tolist()
+            kv_size_per_layer = (num_tok, len(head_indices), self.head_size)
             
             rebuilt_kv_cache = []
-            for l in range(self.num_layer):
+            for l in layer_indices:
                 logger.debug(f"receiving layer {l}")
                 
                 # receive key tensor
-                key_tensor = torch.empty((num_computed_token, self.num_heads, self.head_size),
-                                        dtype=self.dtype)
-                torch.distributed.recv(
-                    key_tensor,
-                    self.target_rank_for_recv,
-                    self.cpu_group,
-                    tag=DISTRIBUTED_KV_GLOO_TAG)
+                key_tensor = self.transport.recv(kv_size_per_layer, dtype=self.dtype)
                     
                 # receive value tensor
-                value_tensor = torch.empty((num_computed_token, self.num_heads, self.head_size),
-                                        dtype=self.dtype)
-                torch.distributed.recv(
-                    value_tensor,
-                    self.target_rank_for_recv,
-                    self.cpu_group,
-                    tag=DISTRIBUTED_KV_GLOO_TAG)
+                value_tensor = self.transport.recv(kv_size_per_layer, dtype=self.dtype)
                 
                 rebuilt_kv_cache.append((key_tensor, value_tensor))
             
             self.cache_engine.store(token_tensor, rebuilt_kv_cache, blocking = False)
             
             # TODO(Jiayi): Is there a way to simply skip receiving `hidden_states`
-            null_hidden_states = torch.empty([num_token, self.hidden_size],
-                                        dtype=self.dtype)
-            torch.distributed.recv(
-                null_hidden_states,
-                self.target_rank_for_recv,
-                self.cpu_group,
-                tag=DISTRIBUTED_KV_GLOO_TAG)
+            null_hidden_size = (num_tok, self.hidden_size)
+            null_hidden_states = self.transport.recv(null_hidden_size, dtype=self.dtype)
     
 
-    def send_kv_start(
-        self,
-    ):
-        
-        size_tensor = torch.tensor([0,0])
-        torch.distributed.recv(
-            size_tensor,
-            self.target_rank_for_recv,
-            self.cpu_group,
-            tag=DISTRIBUTED_KV_GLOO_TAG)
-        logger.debug(f"Receiving size tensor done")
-        
-        token_ids_list_tensor = torch.empty(size_tensor.tolist(), dtype=torch.long)
-        torch.distributed.recv(
-            token_ids_list_tensor,
-            self.target_rank_for_recv,
-            self.cpu_group,
-            tag=DISTRIBUTED_KV_GLOO_TAG)
-        logger.debug(f"Receiving token_ids_list tensor done")
-        return token_ids_list_tensor.tolist()
 
         
     
-    # send is not muti-threaded for now
     def retrive_kv_and_send(
         self,
     ):
-        token_ids_list = self.send_kv_start()
-        logger.info(f"Retrieving {len(token_ids_list)} reqs")
-        num_req = len(token_ids_list)
-        num_hit = 0
-        for token_ids in token_ids_list:
-            
-            #tuple_kv: (K,V)*num_layer
-            #K/V: [num_retrieved_tokens, num_heads, head_size]
-            token_tensor = torch.tensor(token_ids, device=self.device)
-            num_tok = len(token_ids)
+        meta_r = self.transport.receive_object()
+        token_ids = meta_r["token_ids"]
+        
+        meta_s = {
+            "token_ids": meta_r["token_ids"],
+            "layer_range": meta_r["token_ids"],
+            "token_range": [],
+            "head_range": meta_r["token_ids"]}
+        logger.info(f"Retrieving {len(token_ids)} reqs")
+        
+        # This is inefficient extra temporary buffer when multiple reqs are received
+        tuple_kvs = []
+        for token_tensor in token_ids:
             tuple_kv, num_computed_tok = self.cache_engine.retrive(token_tensor, self.device)
+            # FIXME(Jiayi): Prefix caching is assumed here
+            meta_s["token_range"].append((0, num_computed_tok))
+            tuple_kvs.append(tuple_kv)
+            if num_computed_tok > 0:
+                num_hit += 1
+        logger.info(f"{num_hit} out of {num_req} reqs are hit")
+        
+        num_req = len(token_ids)
+        for req_idx in num_req:
             
-            # send num_computed_tok
-            num_computed_tok_tensor = torch.tensor([num_computed_tok], device=self.device)
-            torch.distributed.send(
-                num_computed_tok_tensor,
-                self.target_rank_for_send,
-                self.cpu_group,
-                tag=DISTRIBUTED_KV_GLOO_TAG)
-            
-            # send num_tok
-            num_tok_tensor = torch.tensor([num_tok], device=self.device)
-            torch.distributed.send(
-                num_tok_tensor,
-                self.target_rank_for_send,
-                self.cpu_group,
-                tag=DISTRIBUTED_KV_GLOO_TAG)
-            
-            # send token_ids back to vllm
-            torch.distributed.send(
-                token_tensor,
-                self.target_rank_for_send,
-                self.cpu_group,
-                tag=DISTRIBUTED_KV_GLOO_TAG)
-            
-            if num_computed_tok == 0:
+            # skip send if cache not hit
+            if not tuple_kv:
                 continue
+            #tuple_kv: (K,V)*num_layer
+            #K/V: [num_retrieved_tokens, num_heads, head_size]  
             
+            layer_range = meta["layer_range"][req_idx]
             
-            for l in range(self.num_layer):
+            for idx in range(len(layer_range)):
+                layer_indices.extend([i for i in range(layer_range[idx][0], layer_range[idx][1])])
+            
+            for l in layer_indices:
                 logger.debug(f"sending layer {l}")
                 # send key tensor
                 key_tensor = tuple_kv[l][0]
-                torch.distributed.send(
-                    key_tensor,
-                    self.target_rank_for_send,
-                    self.cpu_group,
-                    tag=DISTRIBUTED_KV_GLOO_TAG)
+                self.transport.send(key_tensor)
                 
                 # send value tensor
                 value_tensor = tuple_kv[l][1]
-                torch.distributed.send(
-                    value_tensor,
-                    self.target_rank_for_send,
-                    self.cpu_group,
-                    tag=DISTRIBUTED_KV_GLOO_TAG)
+                self.transport.send(value_tensor)
             
             # FIXME(Jiayi): need to send intermediate states instead of a tensor
             # send a useless hidden states
-            logger.debug(f"sending hidden states")
+            logger.debug(f"sending null hidden states")
             null_hidden_tensor = torch.zeros(
                 (len(token_ids), self.hidden_size), 
                 dtype=self.dtype) # null hidden tensor
-            torch.distributed.send(
-                null_hidden_tensor,
-                self.target_rank_for_send,
-                self.cpu_group,
-                tag=DISTRIBUTED_KV_GLOO_TAG)
-            
-            num_hit += 1
-            
-        # Send end signal
-        logger.debug(f"sending end signal")
-        end_signal_tensor = torch.tensor([-1])
-        torch.distributed.send(
-            end_signal_tensor,
-            self.target_rank_for_send,
-            self.cpu_group,
-            tag=DISTRIBUTED_KV_GLOO_TAG)
+            self.transport.send(null_hidden_tensor)
+
         
-        logger.info(f"{num_hit} out of {num_req} reqs are hit")
     
     def run(
         self,
     ):
+        # Do we need an end signal in recv
+        # Otherwise, we need two separate threads for retrieve_kv and recv_kv
         while True:
             self.retrive_kv_and_send()
             self.recv_kv_and_store()
