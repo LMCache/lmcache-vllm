@@ -87,6 +87,7 @@ class LMCVLLMDriver:
         logger.info(f"Injected {len(loaded_block_nums) - 1} blocks")
         return loaded_block_nums[:-1]
 
+    @torch.no_grad()
     def retrive_and_inject(
             self,
             kv_caches: List[torch.Tensor],
@@ -110,6 +111,7 @@ class LMCVLLMDriver:
         else:
             return []
 
+    @torch.no_grad()
     def collect_kv_and_store(
             self,
             kv_caches: List[torch.Tensor],
@@ -141,10 +143,11 @@ class LMCVLLMDriver:
 
         rebuilt_kv_cache = []
         # FIXME: the following code is not really readable
+        # FIXME(Jiayi): a load kernel could make the following code faster
         for kv_layer in kv_caches:
             k_cache, v_cache = PagedAttention.split_kv_cache(kv_layer, num_kv_heads, head_size)
-            v = v_cache.permute([0, 3, 1, 2]).reshape(-1, num_kv_heads, head_size)[slot_mapping]
-            k = k_cache.permute([0, 3, 1, 2, 4]).reshape(-1, num_kv_heads, head_size)[slot_mapping]
+            v = v_cache.permute([0, 3, 1, 2]).reshape(-1, num_kv_heads, head_size)[slot_mapping].contiguous()
+            k = k_cache.permute([0, 3, 1, 2, 4]).reshape(-1, num_kv_heads, head_size)[slot_mapping].contiguous()
             rebuilt_kv_cache.append((k, v))
 
         self.cache_engine.store(token_ids, rebuilt_kv_cache, blocking = False)
