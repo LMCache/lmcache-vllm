@@ -34,6 +34,7 @@ class LMCVLLMDriver:
         self.parallel_config = parallel_config
         self.device = device
 
+        #self.tmp_buffer_device = "cpu"
         self.block_size: int
 
     def set_block_size(
@@ -75,7 +76,7 @@ class LMCVLLMDriver:
             slot_mapping.append(slot)
 
         # FIXME: what if the model is not on GPU? Consider using to(self.device) instead of cuda()
-        slot_mapping = torch.tensor(slot_mapping).cuda()
+        slot_mapping = torch.tensor(slot_mapping).to(self.device)#cuda()
 
         num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
         head_size = self.model_config.get_head_size()
@@ -87,6 +88,7 @@ class LMCVLLMDriver:
         logger.info(f"Injected {len(loaded_block_nums) - 1} blocks")
         return loaded_block_nums[:-1]
 
+    @torch.no_grad()
     def retrive_and_inject(
             self,
             kv_caches: List[torch.Tensor],
@@ -103,13 +105,14 @@ class LMCVLLMDriver:
             loaded_block_nums: the block idx of the blocks that are being injected.
                                Can be an empty list if nothing is injected
         """
-        loaded_kv, loaded_kv_len = self.cache_engine.retrive(torch.tensor(token_ids), self.device)
+        loaded_kv, loaded_kv_len = self.cache_engine.retrive(torch.tensor(token_ids))
         if loaded_kv_len > self.block_size: # skip if less than a single block
             loaded_block_nums = self._inject_kv_cache(kv_caches, loaded_kv, loaded_kv_len, block_table)
             return loaded_block_nums
         else:
             return []
 
+    @torch.no_grad()
     def collect_kv_and_store(
             self,
             kv_caches: List[torch.Tensor],
@@ -141,10 +144,12 @@ class LMCVLLMDriver:
 
         rebuilt_kv_cache = []
         # FIXME: the following code is not really readable
+        # FIXME(Jiayi): a load kernel could make the following code faster
+        # FIXME(Jiayi): no need to perform the following step if cache already exists
         for kv_layer in kv_caches:
             k_cache, v_cache = PagedAttention.split_kv_cache(kv_layer, num_kv_heads, head_size)
-            v = v_cache.permute([0, 3, 1, 2]).reshape(-1, num_kv_heads, head_size)[slot_mapping]
-            k = k_cache.permute([0, 3, 1, 2, 4]).reshape(-1, num_kv_heads, head_size)[slot_mapping]
+            v = v_cache.permute([0, 3, 1, 2]).reshape(-1, num_kv_heads, head_size)[slot_mapping].contiguous()
+            k = k_cache.permute([0, 3, 1, 2, 4]).reshape(-1, num_kv_heads, head_size)[slot_mapping].contiguous()
             rebuilt_kv_cache.append((k, v))
 
         self.cache_engine.store(token_ids, rebuilt_kv_cache, blocking = False)
