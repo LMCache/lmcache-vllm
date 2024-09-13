@@ -72,3 +72,38 @@ def broadcast_tokens_and_block_tables(
         return ret
     else:
         return broadcast_list(is_driver_worker, ret, device)
+
+# TODO(Jiayi): error handling
+def init_vllm_comm(
+    backend, 
+    world_size, 
+    lmc_rank, 
+    tp_ranks,
+    pp_ranks,
+    vllm_ranks,
+    world_ranks,
+    distributed_init_method):
+    # Initialize vllm-related commuication here
+    # Only related vllm, not lmcache
+    torch.distributed.init_process_group(
+        backend=backend,
+        init_method=distributed_init_method,
+        world_size=world_size,
+        rank=lmc_rank)
+    
+    # TODO(Jiayi): TP/PP/World should be passed in as params
+    for ranks in vllm_ranks:
+        device_group_world = torch.distributed.new_group(ranks, backend=backend)
+        cpu_group_world = torch.distributed.new_group(ranks, backend="gloo")
+    
+    for ranks in tp_ranks:
+        device_group_TP = torch.distributed.new_group(ranks, backend=backend)
+        cpu_group_TP = torch.distributed.new_group(ranks, backend="gloo")
+    
+    for ranks in pp_ranks:
+        device_group_PP = torch.distributed.new_group(ranks, backend=backend)
+        cpu_group_PP = torch.distributed.new_group(ranks, backend="gloo")
+    
+    for ranks in world_ranks:
+        device_group = torch.distributed.new_group(ranks, backend=backend)
+        cpu_group = torch.distributed.new_group(ranks, backend="gloo")

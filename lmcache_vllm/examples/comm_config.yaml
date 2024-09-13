@@ -1,0 +1,4 @@
+backend: 'nccl'
+distributed_init_method: 'tcp://128/135/164/123:12345'
+world_size: 2
+lmc_rank: 1

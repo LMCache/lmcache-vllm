@@ -1,0 +1,5 @@
+start_layer: 0
+end_layer: 32
+head_size: 128
+dtype: "float16"
+hidden_size: 4096

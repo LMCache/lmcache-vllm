@@ -39,6 +39,7 @@ INT2DTYPE = {
 }
 
 
+
 class BrokenPipeException(Exception):
     def __init__(self, message):
         self.message = message
@@ -49,6 +50,7 @@ class TorchDistributedPipe:
     METADATA_LENGTH = 16
     MAX_TENSOR_DIMENSIONS = 14
     METADATA_DTYPE = torch.int64
+
 
     def __init__(
         self,
@@ -73,11 +75,9 @@ class TorchDistributedPipe:
         assert self.device_group is not None
         assert self.rank_in_group <= 1
 
-        if torch.cuda.is_available():
-            self.device = torch.device(f"cuda:{local_rank}")
-        else:
-            self.device = torch.device("cpu")
+        self.device = self._select_device(torch_distributed_backend)
 
+        # TODO(Jiayi): check the correctness of the next lines
         self.target_rank_for_send = self.ranks[
             (self.rank_in_group + 1) % self.world_size
         ]
@@ -88,6 +88,7 @@ class TorchDistributedPipe:
         # FIXME: why we need this?
         torch.set_default_device(self.device)
 
+        # TODO(Jiayi): Do we need buffer and transport thread?
         self.transport_thread = None
         self.buffer_size = 0
         self.buffer_size_lock = threading.Lock()
@@ -98,6 +99,12 @@ class TorchDistributedPipe:
         self.rcv_metadata_buffer = torch.zeros(
             self.METADATA_LENGTH, dtype=self.METADATA_DTYPE, device=self.device
         )
+
+    def _select_device(self, backend: Union[str, Backend]):
+        if torch.cuda.is_available() and backend == Backend.NCCL:
+            return torch.device(f"cuda:{self.local_rank}")
+        else:
+            return "cpu"
 
     def _make_metadata(self, tensor: torch.Tensor) -> torch.Tensor:
         """
@@ -168,11 +175,12 @@ class TorchDistributedPipe:
             race conditions during sending/receiving. Therefore, the metadata
             buffer can be reused
         """
-        torch.distributed.recv(
+        task = torch.distributed.recv(
             self.rcv_metadata_buffer,
             src=self.target_rank_for_recv,
             group=self.device_group,
         )
+
         return self.rcv_metadata_buffer
 
     def _send_impl(self, tensor):
@@ -256,15 +264,16 @@ class TorchDistributedPipe:
             # print("Remaining size:", self.buffer_size)
             self.buffer_size = self.buffer_size + tensor_size
 
-        # prepare the metadata before sending the tensor.
+
+        #self.send_tensor_wrapper(tensor)
         self.transport_thread.submit(
             self.send_tensor_wrapper,
             tensor,
         )
 
+
     def recv_tensor(self) -> Optional[torch.Tensor]:
         """Receives a tensor from the src rank. Blocking."""
-
         if self.transport_thread is None:
             self.transport_thread = ThreadPoolExecutor(max_workers=1)
 
@@ -275,6 +284,8 @@ class TorchDistributedPipe:
         except Exception as e:
             logger.error("Encountering exception in KV receiving thread")
             logger.error("%s", e)
+
+        #tensor = self._recv_impl()
 
         if tensor.numel() == 1 and tensor.item() == NONE_INT:
             return None
@@ -291,78 +302,3 @@ class TorchDistributedPipe:
         ):
             self.transport_thread.shutdown()
 
-
-'''
-class Transport:
-    def __init__(self, comm_config):
-        # TODO(Jiayi): initialize the commuication here    
-        self.backend = comm_config.get("backend")
-        self.world_size =comm_config.get("world_size")
-        self.lmc_rank =comm_config.get("lmc_rank")
-        self.distributed_init_method = comm_config.get("distributed_init_method")
-        self.target_rank_for_recv = comm_config.get("target_rank_for_recv")
-        self.target_rank_for_send = comm_config.get("target_rank_for_send")
-        self.device = torch.device("cpu")
-        torch.distributed.init_process_group(
-            backend=self.backend,
-            init_method=self.distributed_init_method,
-            world_size=self.world_size,
-            rank=self.lmc_rank)
-        
-        # FIXME(Jiayi): remove this hardcode
-        # TODO(Jiayi): TP/PP/World should be passed in as params
-        ranks = [0]
-        self.device_group_world = torch.distributed.new_group(ranks, backend=self.backend)
-        self.cpu_group_world = torch.distributed.new_group(ranks, backend="gloo")
-        
-        self.device_group_TP = torch.distributed.new_group(ranks, backend=self.backend)
-        self.cpu_group_TP = torch.distributed.new_group(ranks, backend="gloo")
-        
-        self.device_group_PP = torch.distributed.new_group(ranks, backend=self.backend)
-        self.cpu_group_PP = torch.distributed.new_group(ranks, backend="gloo")
-        
-        # FIXME(Jiayi): remove this hardcode
-        ranks = [0, 1]
-        self.device_group = torch.distributed.new_group(ranks, backend=self.backend)
-        self.cpu_group = torch.distributed.new_group(ranks, backend="gloo")
-    
-    def send(self, t: torch.Tensor):
-        torch.distributed.send(
-            t,
-            self.target_rank_for_send,
-            self.cpu_group,
-            tag=DISTRIBUTED_KV_GLOO_TAG)
-    
-    def recv(self, size: Tuple, dtype: torch.dtype):
-        buffer = torch.empty(size, dtype=dtype)
-        torch.distributed.recv(
-            t,
-            self.target_rank_for_recv,
-            self.cpu_group,
-            tag=DISTRIBUTED_KV_GLOO_TAG)
-        return t
-    
-    
-    def send_object(self, obj):
-        # Serialize object to tensor and get the size as well
-        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
-        size_tensor = torch.tensor([object_tensor.numel()],
-                                   dtype=torch.long,
-                                   device="cpu")
-        # Send object size
-        self.send(size_tensor)
-
-        # Send object
-        self.send(object_tensor)
-        
-    def recv_object(self) -> Any:
-        # Receive object size
-        rank_size = self.recv((1), dtype=torch.long)
-        rank_size = rank_size.item()
-        
-        # Tensor to receive serialized objects into.
-        object_tensor = self.recv(rank_size, dtype=torch.uint8)
-
-        obj = pickle.loads(object_tensor.numpy().tobytes())
-        return obj
-'''
