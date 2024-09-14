@@ -27,6 +27,6 @@ if __name__ == '__main__':
     cache_engine = LMCacheEngineBuilder.get("vllm")
     lmcache_driver = LMCVLLMDriver_V2(vllm_config, comm_config, cache_engine)
     
+    # Start LMC
+    lmcache_driver.run()
     
-    while True:
-        pass

@@ -41,8 +41,8 @@ class LMCVLLMDriver_V2:
         # comm related configs
         # TODO (Jiayi): simplify the logic and remove hardcodes
         backend = comm_config.get("backend")
-        world_size =comm_config.get("world_size")
-        lmc_rank =comm_config.get("lmc_rank")
+        world_size = comm_config.get("world_size")
+        lmc_rank = comm_config.get("lmc_rank")
         distributed_init_method = comm_config.get("distributed_init_method")
         tp_ranks = [[0]]
         pp_ranks = [[0]]
@@ -55,8 +55,12 @@ class LMCVLLMDriver_V2:
         # initialize two pipes
         # parse comfig here
         group_ranks = [[0, 1]]
-        self.send_pipe = TorchDistributedPipe(group_ranks, lmc_rank, backend)
+        
         self.recv_pipe = TorchDistributedPipe(group_ranks, lmc_rank, backend)
+        self.recv_signal_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
+        
+        self.send_pipe = TorchDistributedPipe(group_ranks, lmc_rank, backend)
+        self.send_signal_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
         
         # lmc cache engine
         self.cache_engine = cache_engine
@@ -68,14 +72,14 @@ class LMCVLLMDriver_V2:
         # others
         logger.info("LMCache driver initialized!!!")
         
+        # Indicate signals
+        self.normal_signal = torch.tensor([0])
+        self.end_signal = None
+        
         # Start recv and send threads
         self.send_thread = threading.Thread(target=self.retrive_kv_and_send, args=())
         self.recv_thread = threading.Thread(target=self.recv_kv_and_store, args=())
         
-        self.send_thread.start()
-        logger.info("LMCache send thread start running!!!")
-        self.recv_thread.start()
-        logger.info("LMCache recv thread start running!!!")
 
         # Protocol
         # Send-------------------------------Recv
@@ -99,6 +103,7 @@ class LMCVLLMDriver_V2:
         while True: 
             # ping vllm to kick off kv cache transfer
             # send input tokens
+            self.recv_signal_pipe.send_tensor(self.normal_signal)
             self.recv_pipe.send_tensor(None)
             # send roi (TODO(Jiayi): roi can be skipped??)
             self.recv_pipe.send_tensor(None)
@@ -129,12 +134,17 @@ class LMCVLLMDriver_V2:
             self.cache_engine.store(input_tokens, rebuilt_kv_cache, blocking=False)
 
     
-        
+    def _is_end_signal(self, signal):
+        return signal is None
     
     def retrive_kv_and_send(
         self,
     ):
         while True:
+            signal = self.signal_pipe.recv_tensor()
+            if self._is_end_signal(signal):
+                logger.info("Received end signal!")
+                break
             input_tokens = self.send_pipe.recv_tensor()
             roi_null = self.send_pipe.recv_tensor()
             
@@ -169,8 +179,14 @@ class LMCVLLMDriver_V2:
             self.send_pipe.send_tensor(value) # value
             self.send_pipe.send_tensor(None) # null hdden
 
-    def close(
+    def run(
         self,
     ):
-        pass
+        self.send_thread.start()
+        logger.info("LMCache send thread start running!!!")
+        self.recv_thread.start()
+        logger.info("LMCache recv thread start running!!!")
+        
+        while True:
+            time.sleep(10)
         
