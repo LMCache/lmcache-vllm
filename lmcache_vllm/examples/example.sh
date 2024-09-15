@@ -22,6 +22,6 @@ VLLM_LOGGING_LEVEL=DEBUG VLLM_RPC_PORT=5570 VLLM_DISAGG_PREFILL_ROLE=lmc CUDA_VI
 
 
 # lmc driver
-python lmcache_main.py &
+python entrypoints.py &
 sleep 10
 wait_for_server 8100
