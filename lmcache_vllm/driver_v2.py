@@ -6,8 +6,8 @@ import threading
 
 from lmcache.cache_engine import LMCacheEngine
 from lmcache.logging import init_logger
-from utils import init_vllm_comm
-from pipe import TorchDistributedPipe
+from .utils import init_vllm_comm
+from .pipe import TorchDistributedPipe
 
 #import vllm.distributed.distributed_kv as dist_kv
 
