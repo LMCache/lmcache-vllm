@@ -13,12 +13,12 @@ wait_for_server() {
 }
 
 # vllm instance
-VLLM_LOGGING_LEVEL=DEBUG VLLM_RPC_PORT=5570 VLLM_DISAGG_PREFILL_ROLE=lmc CUDA_VISIBLE_DEVICES=0 python3 \
+VLLM_LOGGING_LEVEL=DEBUG VLLM_RPC_PORT=5570 VLLM_DISAGG_PREFILL_ROLE=lmcache CUDA_VISIBLE_DEVICES=0 python3 \
     -m vllm.entrypoints.openai.api_server \
-    --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --model mistralai/Mistral-7B-Instruct-v0.2 \
     --port 8100 \
     --max-model-len 5000 \
-    --gpu-memory-utilization 0.4 &
+    --gpu-memory-utilization 0.5 &
 
 
 # lmc driver
