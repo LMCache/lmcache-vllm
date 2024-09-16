@@ -48,6 +48,7 @@ class LMCVLLMDriver_V2:
         pp_ranks = [[0]]
         vllm_ranks = [[0]]
         world_ranks = [[0,1]]
+        
         # Init vllm-related communicatons
         init_vllm_comm(backend, world_size, lmc_rank, tp_ranks, pp_ranks, vllm_ranks, world_ranks, distributed_init_method)
         logger.info("vllm successfully initialized on lmc side")
@@ -56,11 +57,13 @@ class LMCVLLMDriver_V2:
         # parse comfig here
         group_ranks = [[0, 1]]
         
-        self.recv_pipe = TorchDistributedPipe(group_ranks, lmc_rank, backend)
+        self.recv_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
         self.recv_signal_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
+        logger.info("LMCache recv pipe initialized!!!")
         
-        self.send_pipe = TorchDistributedPipe(group_ranks, lmc_rank, backend)
+        self.send_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
         self.send_signal_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
+        logger.info("LMCache send pipe initialized!!!")
         
         # lmc cache engine
         self.cache_engine = cache_engine
@@ -141,12 +144,15 @@ class LMCVLLMDriver_V2:
         self,
     ):
         while True:
-            signal = self.signal_pipe.recv_tensor()
+            signal = self.send_signal_pipe.recv_tensor()
+            logger.debug(f"Received signal {signal} in retrive_kv_and_send")
             if self._is_end_signal(signal):
                 logger.info("Received end signal!")
                 break
             input_tokens = self.send_pipe.recv_tensor()
+            logger.debug(f"Received input tokens in retrive_kv_and_send")
             roi_null = self.send_pipe.recv_tensor()
+            logger.debug(f"Received roi in retrive_kv_and_send")
             
             # assume vllm wants kv cache of all tokens
             assert len(roi_null) == len(input_tokens)
@@ -162,6 +168,7 @@ class LMCVLLMDriver_V2:
                 self.send_pipe.send_tensor(None) # null key
                 self.send_pipe.send_tensor(None) # null value
                 self.send_pipe.send_tensor(None) # null hidden
+                continue
             
             # TODO (Jiayi): The following loop and cat can be optimized by changing cache_engine
             key_list = []

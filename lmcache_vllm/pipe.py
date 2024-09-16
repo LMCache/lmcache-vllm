@@ -5,14 +5,16 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import time
 
-from vllm.logger import init_logger
+from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
 
 
-# if the tensor is only one-element and only contains this number
+# if the tensor is only one-element and only contains NONE_INT
 # this means that the sended object is None.
 NONE_INT = -150886311
+
+# Mapping tensor dtype to a int, used for tensor metadata transmission
 FLOAT16_INT = -543205003776624
 INT64_INT = -375623078607432
 BOOL_INT = -28035262008646
@@ -39,8 +41,8 @@ INT2DTYPE = {
 }
 
 
-
 class BrokenPipeException(Exception):
+
     def __init__(self, message):
         self.message = message
         super().__init__(self.message)
@@ -50,7 +52,6 @@ class TorchDistributedPipe:
     METADATA_LENGTH = 16
     MAX_TENSOR_DIMENSIONS = 14
     METADATA_DTYPE = torch.int64
-
 
     def __init__(
         self,
@@ -64,8 +65,7 @@ class TorchDistributedPipe:
 
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
+                ranks, backend=torch_distributed_backend)
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
@@ -77,28 +77,24 @@ class TorchDistributedPipe:
 
         self.device = self._select_device(torch_distributed_backend)
 
-        # TODO(Jiayi): check the correctness of the next lines
-        self.target_rank_for_send = self.ranks[
-            (self.rank_in_group + 1) % self.world_size
-        ]
-        self.target_rank_for_recv = self.ranks[
-            (self.rank_in_group - 1) % self.world_size
-        ]
+        self.target_rank_for_send = self.ranks[(self.rank_in_group + 1) %
+                                               self.world_size]
+        self.target_rank_for_recv = self.ranks[(self.rank_in_group - 1) %
+                                               self.world_size]
 
         # FIXME: why we need this?
         torch.set_default_device(self.device)
 
-        # TODO(Jiayi): Do we need buffer and transport thread?
-        self.transport_thread = None
+        self.transport_thread: Optional[ThreadPoolExecutor] = None
         self.buffer_size = 0
         self.buffer_size_lock = threading.Lock()
 
         self.none_tensor = torch.tensor([NONE_INT], device=self.device)
 
         # On-device tensors to be reused for recv
-        self.rcv_metadata_buffer = torch.zeros(
-            self.METADATA_LENGTH, dtype=self.METADATA_DTYPE, device=self.device
-        )
+        self.rcv_metadata_buffer = torch.zeros(self.METADATA_LENGTH,
+                                               dtype=self.METADATA_DTYPE,
+                                               device=self.device)
 
     def _select_device(self, backend: Union[str, Backend]):
         if torch.cuda.is_available() and backend == Backend.NCCL:
@@ -130,14 +126,12 @@ class TorchDistributedPipe:
         buffer[0] = DTYPE2INT[tensor.dtype]
         ndims = len(tensor.shape)
         buffer[1] = len(tensor.shape)
-        buffer[2 : 2 + ndims] = torch.tensor(
-            tensor.shape, dtype=self.METADATA_DTYPE
-        )
+        buffer[2:2 + ndims] = torch.tensor(tensor.shape,
+                                           dtype=self.METADATA_DTYPE)
         return buffer.to(self.device)
 
-    def _prepare_recv_buffer(
-        self, d_metadata_buffer: torch.Tensor
-    ) -> torch.Tensor:
+    def _prepare_recv_buffer(self,
+                             d_metadata_buffer: torch.Tensor) -> torch.Tensor:
         """
         Create a buffer to receive the tensor based on the metadata.
 
@@ -150,7 +144,7 @@ class TorchDistributedPipe:
         h_buffer = d_metadata_buffer.cpu().numpy()
         dtype = INT2DTYPE[h_buffer[0]]
         ndims = h_buffer[1]
-        shape = tuple(h_buffer[2 : 2 + ndims])
+        shape = tuple(h_buffer[2:2 + ndims])
         return torch.empty(shape, dtype=dtype, device=self.device)
 
     def _send_metadata(self, d_metadata_buffer: torch.Tensor):
@@ -175,7 +169,7 @@ class TorchDistributedPipe:
             race conditions during sending/receiving. Therefore, the metadata
             buffer can be reused
         """
-        task = torch.distributed.recv(
+        torch.distributed.recv(
             self.rcv_metadata_buffer,
             src=self.target_rank_for_recv,
             group=self.device_group,
@@ -195,9 +189,9 @@ class TorchDistributedPipe:
         metadata = self._make_metadata(tensor)
         self._send_metadata(metadata)
 
-        torch.distributed.send(
-            tensor, dst=self.target_rank_for_send, group=self.device_group
-        )
+        torch.distributed.send(tensor.to(self.device),
+                               dst=self.target_rank_for_send,
+                               group=self.device_group)
 
     def _recv_impl(self) -> torch.Tensor:
         """
@@ -210,11 +204,13 @@ class TorchDistributedPipe:
             - buffer: the received tensor, on self.device
         """
         d_metadata = self._recv_metadata()
+        logger.debug(f"Received meta {d_metadata}")
         buffer = self._prepare_recv_buffer(d_metadata)
-
-        torch.distributed.recv(
-            buffer, src=self.target_rank_for_recv, group=self.device_group
-        )
+        logger.debug(f"Created buffer with size {buffer.shape}")
+        torch.distributed.recv(buffer,
+                               src=self.target_rank_for_recv,
+                               group=self.device_group)
+        logger.debug(f"Received tensor in buffer {buffer}")
 
         return buffer
 
@@ -227,8 +223,10 @@ class TorchDistributedPipe:
             with self.buffer_size_lock:
                 self.buffer_size = self.buffer_size - tensor_size
         except Exception as e:
-            logger.error("Encountering exception in KV sending thread")
-            logger.error("%s", e)
+            logger.error("[rank%d]: Exception when trying to send %s, msg: %s",
+                         torch.distributed.get_rank(), str(tensor), str(e))
+            import traceback
+            traceback.print_exc()
 
     def block_if_full(self):
         """
@@ -245,8 +243,8 @@ class TorchDistributedPipe:
         Flow: send tensor dim -- send tensor shape -- send tensor data
         """
 
-        if self.transport_thread is None:
-            self.transport_thread = ThreadPoolExecutor(max_workers=1)
+        #if self.transport_thread is None:
+        #    self.transport_thread = ThreadPoolExecutor(max_workers=1)
 
         if tensor is None:
             tensor = self.none_tensor
@@ -261,31 +259,31 @@ class TorchDistributedPipe:
         self.block_if_full()
 
         with self.buffer_size_lock:
-            # print("Remaining size:", self.buffer_size)
             self.buffer_size = self.buffer_size + tensor_size
 
-
-        #self.send_tensor_wrapper(tensor)
-        self.transport_thread.submit(
-            self.send_tensor_wrapper,
-            tensor,
-        )
-
+        self.send_tensor_wrapper(tensor)
+        #self.transport_thread.submit(
+        #    self.send_tensor_wrapper,
+        #    tensor,
+        #)
 
     def recv_tensor(self) -> Optional[torch.Tensor]:
         """Receives a tensor from the src rank. Blocking."""
-        if self.transport_thread is None:
-            self.transport_thread = ThreadPoolExecutor(max_workers=1)
+        #if self.transport_thread is None:
+        #    self.transport_thread = ThreadPoolExecutor(max_workers=1)
 
-        future = self.transport_thread.submit(self._recv_impl)
+        #future = self.transport_thread.submit(self._recv_impl)
 
         try:
-            tensor = future.result()
+            tensor = self._recv_impl()#future.result()
         except Exception as e:
+            # the underlying pipe is likely broken
             logger.error("Encountering exception in KV receiving thread")
             logger.error("%s", e)
-
-        #tensor = self._recv_impl()
+            # fault tolerance: if the pipe is broken, return None
+            import traceback
+            traceback.print_exc()
+            return None
 
         if tensor.numel() == 1 and tensor.item() == NONE_INT:
             return None
@@ -296,9 +294,6 @@ class TorchDistributedPipe:
         """
         Close the pipe and release the resources.
         """
-        if (
-            hasattr(self, "transport_thread")
-            and self.transport_thread is not None
-        ):
+        if (hasattr(self, "transport_thread")
+                and self.transport_thread is not None):
             self.transport_thread.shutdown()
-

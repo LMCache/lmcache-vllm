@@ -75,14 +75,14 @@ def broadcast_tokens_and_block_tables(
 '''
 # TODO(Jiayi): error handling
 def init_vllm_comm(
-    backend, 
-    world_size, 
-    lmc_rank, 
-    tp_ranks,
-    pp_ranks,
-    vllm_ranks,
-    world_ranks,
-    distributed_init_method):
+    backend: str, 
+    world_size: int, 
+    lmc_rank: int, 
+    tp_ranks: List[List[int]],
+    pp_ranks: List[List[int]],
+    vllm_ranks: List[List[int]],
+    world_ranks: List[List[int]],
+    distributed_init_method: str):
     # Initialize vllm-related commuication here
     # Only related vllm, not lmcache
     torch.distributed.init_process_group(
@@ -92,18 +92,23 @@ def init_vllm_comm(
         rank=lmc_rank)
     
     # TODO(Jiayi): TP/PP/World should be passed in as params
+    # Initialize world group
     for ranks in vllm_ranks:
         device_group_world = torch.distributed.new_group(ranks, backend=backend)
         cpu_group_world = torch.distributed.new_group(ranks, backend="gloo")
     
+    # Initialize TP group
     for ranks in tp_ranks:
         device_group_TP = torch.distributed.new_group(ranks, backend=backend)
         cpu_group_TP = torch.distributed.new_group(ranks, backend="gloo")
     
+    # Initialize PP group
     for ranks in pp_ranks:
         device_group_PP = torch.distributed.new_group(ranks, backend=backend)
         cpu_group_PP = torch.distributed.new_group(ranks, backend="gloo")
     
+    '''
     for ranks in world_ranks:
         device_group = torch.distributed.new_group(ranks, backend=backend)
         cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+    '''
