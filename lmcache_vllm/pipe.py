@@ -204,13 +204,13 @@ class TorchDistributedPipe:
             - buffer: the received tensor, on self.device
         """
         d_metadata = self._recv_metadata()
-        logger.debug(f"Received meta {d_metadata}")
+        #logger.debug(f"Received meta {d_metadata}")
         buffer = self._prepare_recv_buffer(d_metadata)
-        logger.debug(f"Created buffer with size {buffer.shape}")
+        #logger.debug(f"Created buffer with size {buffer.shape}")
         torch.distributed.recv(buffer,
                                src=self.target_rank_for_recv,
                                group=self.device_group)
-        logger.debug(f"Received tensor in buffer {buffer}")
+        #logger.debug(f"Received tensor in buffer {buffer}")
 
         return buffer
 

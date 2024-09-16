@@ -115,7 +115,8 @@ class LMCVLLMDriver_V2:
             if input_tokens is None:
                 logger.debug(f"vllm buffer is empty. Nothing has been retrieved...")
                 # TODO(Jiayi): need to have some kind of rate control logic here
-                time.sleep(0.1)
+                time.sleep(1)
+                continue
             # recv redundant roi
             _ = self.recv_pipe.recv_tensor()
             
@@ -131,7 +132,8 @@ class LMCVLLMDriver_V2:
             keys = torch.unbind(keys)
             values = torch.unbind(values)
             rebuilt_kv_cache = []
-            for layer_idx in len(keys):
+            for layer_idx in range(len(keys)):
+                logger.debug(f"received k shape {keys[layer_idx].shape}")
                 rebuilt_kv_cache.append((keys[layer_idx], values[layer_idx]))
             
             self.cache_engine.store(input_tokens, rebuilt_kv_cache, blocking=False)
@@ -150,38 +152,45 @@ class LMCVLLMDriver_V2:
                 logger.info("Received end signal!")
                 break
             input_tokens = self.send_pipe.recv_tensor()
-            logger.debug(f"Received input tokens in retrive_kv_and_send")
+            #logger.debug(f"Received input tokens in retrive_kv_and_send")
             roi_null = self.send_pipe.recv_tensor()
-            logger.debug(f"Received roi in retrive_kv_and_send")
+            #logger.debug(f"Received roi in retrive_kv_and_send")
             
             # assume vllm wants kv cache of all tokens
             assert len(roi_null) == len(input_tokens)
             
             # TODO(Jiayi): retrieve needs to put tensor on cpu
             tuple_kv, num_computed_tok = self.cache_engine.retrive(input_tokens)
-            if tuple_kv is None:
+            if num_computed_tok==0:
                 self.send_pipe.send_tensor(None) # null input_tensor
+                #logger.debug(f"Sent null input tokens in retrive_kv_and_send")
                 
                 # TODO(Jiayi): the following sends ca be optimized w.
                 # an earlier None handler on vllm side
                 self.send_pipe.send_tensor(None) # null roi
+                #logger.debug(f"Sent null roi in retrive_kv_and_send")
                 self.send_pipe.send_tensor(None) # null key
+                #logger.debug(f"Sent null key in retrive_kv_and_send")
                 self.send_pipe.send_tensor(None) # null value
+                #logger.debug(f"Sent null value in retrive_kv_and_send")
                 self.send_pipe.send_tensor(None) # null hidden
+                #logger.debug(f"Sent null hidden in retrive_kv_and_send")
+                #logger.debug(f"Sent done in retrive_kv_and_send")
                 continue
             
             # TODO (Jiayi): The following loop and cat can be optimized by changing cache_engine
             key_list = []
             value_list = []
             for layer_idx in range(len(tuple_kv)):
-                key_list.append(tuple_kv[layer_idx][0])
-                value_list.append(tuple_kv[layer_idx][1])
+                key_list.append(torch.unsqueeze(tuple_kv[layer_idx][0], dim=0))
+                value_list.append(torch.unsqueeze(tuple_kv[layer_idx][1], dim=0))
             key = torch.cat(key_list)
             value = torch.cat(value_list)
             roi = torch.tensor([i for i in range(num_computed_tok)])
             
             self.send_pipe.send_tensor(input_tokens) # input_tokens
             self.send_pipe.send_tensor(roi) # roi
+            logger.debug(f"sent k shape {key.shape}")
             self.send_pipe.send_tensor(key) # key
             self.send_pipe.send_tensor(value) # value
             self.send_pipe.send_tensor(None) # null hdden
