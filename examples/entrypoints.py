@@ -9,9 +9,9 @@ if __name__ == '__main__':
     
     # TODO(Jiayi): Most configs are hard-coded in yaml for now
     # Maybe they can be sent from vllm during init
-    vllm_config = yaml.safe_load(open("/dataheart/jiayi3/lmcache-2/LMCache/examples/vllm_config.yaml"))
+    vllm_config = yaml.safe_load(open("vllm_config.yaml"))
     
-    lmcache_config_file = "/dataheart/jiayi3/lmcache-2/LMCache/examples/example.yaml"
+    lmcache_config_file = "lmcache_config.yaml"
     
     # TODO(Jiayi): need to use multiprocessing to launch multiple cache engines
     vllm_rank = 0
