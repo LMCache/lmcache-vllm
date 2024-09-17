@@ -52,5 +52,5 @@ if __name__ == '__main__':
     for vllm_rank in range(vllm_world_size):
         p = Process(target=init_lmc, args=(vllm_config, lmcache_config_file, vllm_rank, vllm_world_size))
         p.start()
-    p.join()
     
+    #TODO(Jiayi): add error handling and join process
