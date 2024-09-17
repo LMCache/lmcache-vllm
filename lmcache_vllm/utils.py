@@ -105,7 +105,6 @@ def init_comm(
     logger.info("vllm successfully initialized on lmc side")
     
     # initialize four pipes
-    # TODO(Jiayi): seems that we have created some redundant groups during pipe init
     self.recv_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
     self.recv_signal_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
     logger.info("LMCache recv pipe initialized!!!")
