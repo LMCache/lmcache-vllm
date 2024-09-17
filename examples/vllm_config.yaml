@@ -1,3 +1,4 @@
+model_name: 'mistral-7b'
 start_layer: 0
 end_layer: 32
 head_size: 128
