@@ -7,25 +7,29 @@ from lmcache.config import LMCacheEngineConfig, LMCacheEngineMetadata
 
 if __name__ == '__main__':
     
-    # TODO(Jiayi): Most configs are hard-coded for now
+    # TODO(Jiayi): Most configs are hard-coded in yaml for now
     # Maybe they can be sent from vllm during init
-    comm_config = yaml.safe_load(open("/dataheart/jiayi3/lmcache-2/LMCache/examples/comm_config.yaml"))
     vllm_config = yaml.safe_load(open("/dataheart/jiayi3/lmcache-2/LMCache/examples/vllm_config.yaml"))
     
     lmcache_config_file = "/dataheart/jiayi3/lmcache-2/LMCache/examples/example.yaml"
     
+    # TODO(Jiayi): need to use multiprocessing to launch multiple cache engines
+    vllm_rank = 0
+    vllm_world_rank = 1
+    lmc_rank = 1
+    
     
     lmcache_metadata = LMCacheEngineMetadata(
-        "mistral-7b",#model_name, 
-        comm_config.get("world_size"),#maybe_lmc_vllm_world_size, 
-        comm_config.get("lmc_rank"),#maybe_vllm_rank, 
+        "mistral-7b",
+        vllm_world_rank,
+        vllm_rank,
         fmt="vllm")
     lmcache_config = LMCacheEngineConfig.from_file(lmcache_config_file)
     cache_engine = LMCacheEngineBuilder.get_or_create("vllm", lmcache_config, lmcache_metadata)
     
     # Init LMCEngine & LMCDriver
     cache_engine = LMCacheEngineBuilder.get("vllm")
-    lmcache_driver = LMCVLLMDriver_V2(vllm_config, comm_config, cache_engine)
+    lmcache_driver = LMCVLLMDriver_V2(vllm_config, lmc_rank, cache_engine)
     
     # Start LMC
     lmcache_driver.run()

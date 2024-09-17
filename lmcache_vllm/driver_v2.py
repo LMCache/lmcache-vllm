@@ -6,7 +6,7 @@ import threading
 
 from lmcache.cache_engine import LMCacheEngine
 from lmcache.logging import init_logger
-from .utils import init_vllm_comm
+from .utils import init_comm
 from .pipe import TorchDistributedPipe
 
 #import vllm.distributed.distributed_kv as dist_kv
@@ -24,8 +24,8 @@ class LMCVLLMDriver_V2:
     def __init__(
         self,
         vllm_config,
-        comm_config,
         cache_engine,
+        lmc_rank: int,
     ):
         # vllm-related configs
         self.start_layer = vllm_config.get("start_layer")
@@ -40,30 +40,22 @@ class LMCVLLMDriver_V2:
         
         # comm related configs
         # TODO (Jiayi): simplify the logic and remove hardcodes
-        backend = comm_config.get("backend")
-        world_size = comm_config.get("world_size")
-        lmc_rank = comm_config.get("lmc_rank")
-        distributed_init_method = comm_config.get("distributed_init_method")
-        tp_ranks = [[0]]
-        pp_ranks = [[0]]
-        vllm_ranks = [[0]]
-        world_ranks = [[0,1]]
+        backend = vllm_config.get("backend")
+        tensor_model_parallel_size = vllm_config.get("tensor_model_parallel_size")
+        pipeline_model_parallel_size = vllm_config.get("pipeline_model_parallel_size")
+        distributed_init_method = vllm_config.get("distributed_init_method")
         
-        # Init vllm-related communicatons
-        init_vllm_comm(backend, world_size, lmc_rank, tp_ranks, pp_ranks, vllm_ranks, world_ranks, distributed_init_method)
-        logger.info("vllm successfully initialized on lmc side")
+        # Init communications and crate pipes
+        pipes = init_comm(
+            backend, 
+            lmc_rank, 
+            tensor_model_parallel_size, 
+            pipeline_model_parallel_size, 
+            distributed_init_method)
         
-        # initialize two pipes
-        # parse comfig here
-        group_ranks = [[0, 1]]
+        self.recv_pipe, self.recv_signal_pipe, self.send_pipe, self.send_signal_pipe = \
+            pipes[0], pipes[1], pipes[2], pipes[3]
         
-        self.recv_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
-        self.recv_signal_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
-        logger.info("LMCache recv pipe initialized!!!")
-        
-        self.send_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
-        self.send_signal_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
-        logger.info("LMCache send pipe initialized!!!")
         
         # lmc cache engine
         self.cache_engine = cache_engine

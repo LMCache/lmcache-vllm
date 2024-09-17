@@ -73,6 +73,92 @@ def broadcast_tokens_and_block_tables(
     else:
         return broadcast_list(is_driver_worker, ret, device)
 '''
+
+# each model shard needs a lmc instance (vllm_world_size*2)
+world_size = 2 * tensor_model_parallel_size * pipeline_model_parallel_size
+torch.distributed.init_process_group(
+    backend=backend,
+    init_method=distributed_init_method,
+    world_size=world_size,
+    rank=lmc_rank)
+
+def init_comm(
+    backend: str,
+    lmc_rank: int,
+    tensor_model_parallel_size: int,
+    pipeline_model_parallel_size: int,
+    distributed_init_method: str,
+):
+    world_size = 2 * tensor_model_parallel_size * pipeline_model_parallel_size
+    torch.distributed.init_process_group(
+        backend=backend,
+        init_method=distributed_init_method,
+        world_size=world_size,
+        rank=lmc_rank)
+    
+    init_vllm_comm(
+        backend, 
+        tensor_model_parallel_size, 
+        pipeline_model_parallel_size,
+        distributed_init_method)
+    logger.info("vllm successfully initialized on lmc side")
+    
+    # initialize four pipes
+    self.recv_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
+    self.recv_signal_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
+    logger.info("LMCache recv pipe initialized!!!")
+    
+    self.send_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
+    self.send_signal_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
+    logger.info("LMCache send pipe initialized!!!")
+    
+    return recv_pipe, recv_signal_pipe, send_pipe, send_signal_pipe
+    
+    
+    
+# TODO (Jiayi): distributed_init_method should be determined in the same way as vllm
+def init_vllm_comm(
+    backend: str,
+    tensor_model_parallel_size: int,
+    pipeline_model_parallel_size: int,
+    distributed_init_method: str,
+):
+    '''
+    Initialize only vllm-related communications here
+    This is needed as any communication group in torch.distributed requires global initialization
+    '''
+    # each model shard in vllm corresponds to a node
+    vllm_world_size = tensor_model_parallel_size * pipeline_model_parallel_size
+    
+    # Initialize vllm world group
+    vllm_ranks = [[i for i in range(vllm_world_size)]]
+    for ranks in vllm_ranks:
+        device_group_world = torch.distributed.new_group(ranks, backend=backend)
+        cpu_group_world = torch.distributed.new_group(ranks, backend="gloo")
+    
+    # Initialize tp ranks
+    tp_ranks = []
+    num_tp_groups = (vllm_world_size // tensor_model_parallel_size)
+    for i in range(num_tp_groups):
+        ranks = list(
+            range(i * tensor_model_parallel_size,
+                (i + 1) * tensor_model_parallel_size))
+        tp_ranks.append(ranks)
+    for ranks in tp_ranks:
+        device_group_TP = torch.distributed.new_group(ranks, backend=backend)
+        cpu_group_TP = torch.distributed.new_group(ranks, backend="gloo")
+    
+    # Initialize pp ranks
+    pp_ranks = []
+    num_pp_groups = (vllm_world_size // pipeline_model_parallel_size)
+    for i in range(num_pp_groups):
+        ranks = list(range(i, vllm_world_size, num_pipeline_model_parallel_groups))
+        group_ranks.append(ranks)
+    for ranks in pp_ranks:
+        device_group_TP = torch.distributed.new_group(ranks, backend=backend)
+        cpu_group_TP = torch.distributed.new_group(ranks, backend="gloo")
+
+
 # TODO(Jiayi): error handling
 def init_vllm_comm(
     backend: str, 
