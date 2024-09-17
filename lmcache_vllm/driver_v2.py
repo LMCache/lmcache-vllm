@@ -24,8 +24,9 @@ class LMCVLLMDriver_V2:
     def __init__(
         self,
         vllm_config,
-        cache_engine,
         lmc_rank: int,
+        group_ranks: List[List[int]],
+        cache_engine,
     ):
         # vllm-related configs
         self.start_layer = vllm_config.get("start_layer")
@@ -49,6 +50,7 @@ class LMCVLLMDriver_V2:
         pipes = init_comm(
             backend, 
             lmc_rank, 
+            group_ranks,
             tensor_model_parallel_size, 
             pipeline_model_parallel_size, 
             distributed_init_method)

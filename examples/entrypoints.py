@@ -32,7 +32,7 @@ def init_lmc(
     
     # Init LMCEngine & LMCDriver
     cache_engine = LMCacheEngineBuilder.get("vllm")
-    lmcache_driver = LMCVLLMDriver_V2(vllm_config, lmc_rank, cache_engine)
+    lmcache_driver = LMCVLLMDriver_V2(vllm_config, lmc_rank, group_ranks, cache_engine)
     
     # Start LMC
     lmcache_driver.run()

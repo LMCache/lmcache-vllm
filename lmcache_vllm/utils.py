@@ -85,6 +85,7 @@ torch.distributed.init_process_group(
 def init_comm(
     backend: str,
     lmc_rank: int,
+    group_ranks: List[List[int]],
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
     distributed_init_method: str,
@@ -104,6 +105,7 @@ def init_comm(
     logger.info("vllm successfully initialized on lmc side")
     
     # initialize four pipes
+    # TODO(Jiayi): seems that we have created some redundant groups during pipe init
     self.recv_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
     self.recv_signal_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
     logger.info("LMCache recv pipe initialized!!!")
@@ -158,43 +160,3 @@ def init_vllm_comm(
         device_group_TP = torch.distributed.new_group(ranks, backend=backend)
         cpu_group_TP = torch.distributed.new_group(ranks, backend="gloo")
 
-
-# TODO(Jiayi): error handling
-def init_vllm_comm(
-    backend: str, 
-    world_size: int, 
-    lmc_rank: int, 
-    tp_ranks: List[List[int]],
-    pp_ranks: List[List[int]],
-    vllm_ranks: List[List[int]],
-    world_ranks: List[List[int]],
-    distributed_init_method: str):
-    # Initialize vllm-related commuication here
-    # Only related vllm, not lmcache
-    torch.distributed.init_process_group(
-        backend=backend,
-        init_method=distributed_init_method,
-        world_size=world_size,
-        rank=lmc_rank)
-    
-    # TODO(Jiayi): TP/PP/World should be passed in as params
-    # Initialize world group
-    for ranks in vllm_ranks:
-        device_group_world = torch.distributed.new_group(ranks, backend=backend)
-        cpu_group_world = torch.distributed.new_group(ranks, backend="gloo")
-    
-    # Initialize TP group
-    for ranks in tp_ranks:
-        device_group_TP = torch.distributed.new_group(ranks, backend=backend)
-        cpu_group_TP = torch.distributed.new_group(ranks, backend="gloo")
-    
-    # Initialize PP group
-    for ranks in pp_ranks:
-        device_group_PP = torch.distributed.new_group(ranks, backend=backend)
-        cpu_group_PP = torch.distributed.new_group(ranks, backend="gloo")
-    
-    '''
-    for ranks in world_ranks:
-        device_group = torch.distributed.new_group(ranks, backend=backend)
-        cpu_group = torch.distributed.new_group(ranks, backend="gloo")
-    '''
