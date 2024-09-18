@@ -1,10 +1,10 @@
-model_name: 'mistral-7b'
+model_name: 'mistralai/Mistral-7B-Instruct-v0.2'
 start_layer: 0
 end_layer: 32
 head_size: 128
 dtype: "float16"
 hidden_size: 4096
 backend: 'nccl'
-distributed_init_method: 'tcp://128/135/164/123:12345'
+distributed_init_method: 'tcp://128.135.164.123:12345'
 tensor_model_parallel_size: 1
 pipeline_model_parallel_size: 1

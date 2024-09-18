@@ -1,5 +1,7 @@
 import torch
 import yaml
+from multiprocessing import Process
+import multiprocessing as mp
 
 from lmcache.cache_engine import LMCacheEngineBuilder
 from lmcache_vllm import LMCVLLMDriver_V2#, broadcast_tokens_and_block_tables, broadcast_input_ids_list
@@ -12,6 +14,7 @@ def init_lmc(
     vllm_world_size: int):
     
     # create vllm-lmc pairs
+    group_ranks = []
     for i in range(vllm_world_size):
         # vllm rank: i
         # lmc rank: i + world_size
@@ -39,6 +42,9 @@ def init_lmc(
 
 
 if __name__ == '__main__':
+    # Process has to be spawned insted of forked when using cuda/multi-threading in multiprocessing
+    # Otherwise: `RuntimeError: Cannot re-initialize CUDA in forked subprocess``
+    mp.set_start_method("spawn")
     
     # TODO(Jiayi): Most configs are hard-coded in yaml for now
     # Maybe they can be sent from vllm during init
