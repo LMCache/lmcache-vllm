@@ -150,7 +150,7 @@ class LMCVLLMDriver_V2:
                 self.send_pipe.send_tensor(None) # null input_tensor
                 #logger.debug(f"Sent null input tokens in retrive_kv_and_send")
                 
-                # TODO(Jiayi): the following sends ca be optimized w.
+                # TODO(Jiayi): the following sends can be optimized w.
                 # an earlier None handler on vllm side
                 self.send_pipe.send_tensor(None) # null roi
                 self.send_pipe.send_tensor(None) # null key
