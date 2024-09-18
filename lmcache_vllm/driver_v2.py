@@ -17,9 +17,6 @@ logger = init_logger(__name__)
 DISTRIBUTED_KV_GLOO_TAG = 24857323
 
 # FIXME(Jiayi): sometimes the kv might be 8-bit while hidden_states is 16-bit
-
-
-
 class LMCVLLMDriver_V2:
     def __init__(
         self,
@@ -63,7 +60,6 @@ class LMCVLLMDriver_V2:
         self.cache_engine = cache_engine
         # HACK(Jiayi): this is curently a hack
         # might error in multi-layered local backend
-        # TODO (Jiayi): please check the correctness of next line
         cache_engine.engine_.dst_device = "cpu"
         
         # others
@@ -91,9 +87,6 @@ class LMCVLLMDriver_V2:
         #[input_tokens, roi, key, value, hidden]
     
     
-    # TODO(Jiayi): we need to break our assumption of
-    # decoupling device (simply receiving and retrieving a cuda tensor)
-    # maybe a cpu tensor (please config here in init)?
     def recv_kv_and_store(
         self,
     ):
@@ -127,7 +120,7 @@ class LMCVLLMDriver_V2:
             values = torch.unbind(values)
             rebuilt_kv_cache = []
             for layer_idx in range(len(keys)):
-                logger.debug(f"received k shape {keys[layer_idx].shape}")
+                #logger.debug(f"received k shape {keys[layer_idx].shape}")
                 rebuilt_kv_cache.append((keys[layer_idx], values[layer_idx]))
             
             self.cache_engine.store(input_tokens, rebuilt_kv_cache, blocking=False)
@@ -146,9 +139,7 @@ class LMCVLLMDriver_V2:
                 logger.info("Received end signal!")
                 break
             input_tokens = self.send_pipe.recv_tensor()
-            #logger.debug(f"Received input tokens in retrive_kv_and_send")
             roi_null = self.send_pipe.recv_tensor()
-            #logger.debug(f"Received roi in retrive_kv_and_send")
             
             # assume vllm wants kv cache of all tokens
             assert len(roi_null) == len(input_tokens)
@@ -162,14 +153,9 @@ class LMCVLLMDriver_V2:
                 # TODO(Jiayi): the following sends ca be optimized w.
                 # an earlier None handler on vllm side
                 self.send_pipe.send_tensor(None) # null roi
-                #logger.debug(f"Sent null roi in retrive_kv_and_send")
                 self.send_pipe.send_tensor(None) # null key
-                #logger.debug(f"Sent null key in retrive_kv_and_send")
                 self.send_pipe.send_tensor(None) # null value
-                #logger.debug(f"Sent null value in retrive_kv_and_send")
                 self.send_pipe.send_tensor(None) # null hidden
-                #logger.debug(f"Sent null hidden in retrive_kv_and_send")
-                #logger.debug(f"Sent done in retrive_kv_and_send")
                 continue
             
             # TODO (Jiayi): The following loop and cat can be optimized by changing cache_engine
@@ -184,7 +170,6 @@ class LMCVLLMDriver_V2:
             
             self.send_pipe.send_tensor(input_tokens) # input_tokens
             self.send_pipe.send_tensor(roi) # roi
-            logger.debug(f"sent k shape {key.shape}")
             self.send_pipe.send_tensor(key) # key
             self.send_pipe.send_tensor(value) # value
             self.send_pipe.send_tensor(None) # null hdden
