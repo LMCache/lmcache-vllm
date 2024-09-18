@@ -13,7 +13,7 @@ Note that LMCache-server and LMCache are unchanged. I created these two branches
 ```
 bash example.sh
 ```
-### Step 2: Send two consecutiv requests to VLLM with the same prefix
+### Step 2: Send two consecutive requests to VLLM with the same prefix
 ```
 python test_long_prefix.py
 ```
