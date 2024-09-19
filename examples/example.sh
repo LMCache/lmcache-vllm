@@ -13,7 +13,7 @@ wait_for_server() {
 }
 
 # vllm instance
-VLLM_LOGGING_LEVEL=DEBUG VLLM_RPC_PORT=5570 VLLM_DISAGG_PREFILL_ROLE=lmcache CUDA_VISIBLE_DEVICES=0 python3 \
+VLLM_LOGGING_LEVEL=DEBUG VLLM_DISTRIBUTED_KV_ROLE=both CUDA_VISIBLE_DEVICES=0 python3 \
     -m vllm.entrypoints.openai.api_server \
     --model mistralai/Mistral-7B-Instruct-v0.2 \
     --port 8100 \
