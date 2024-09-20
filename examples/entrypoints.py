@@ -1,5 +1,6 @@
 import torch
 import yaml
+import os
 from multiprocessing import Process
 import multiprocessing as mp
 
@@ -40,6 +41,32 @@ def init_lmc(
     # Start LMC
     lmcache_driver.run()
 
+    
+def get_config_from_env():
+    
+    configs = {}
+
+    assert "VLLM_HOST_IP" in os.environ and "VLLM_PORT" in os.environ
+    ip = os.environ["VLLM_HOST_IP"]
+    port = os.environ['VLLM_PORT']
+    configs["distributed_init_method"] = f"tcp://{ip}:{port}"
+
+    assert "VLLM_TP" in os.environ
+    configs["tp"] = int(os.environ["VLLM_TP"])
+
+    assert "VLLM_PP" in os.environ
+    configs["pp"] = int(os.environ["VLLM_PP"])
+
+    assert "VLLM_MODEL_NAME" in os.environ
+    configs["model_name"] = os.environ["VLLM_MODEL_NAME"]
+
+    configs["backend"] = "nccl"
+    
+
+    return configs
+        
+    
+
 
 if __name__ == '__main__':
     # Process has to be spawned insted of forked when using cuda/multi-threading in multiprocessing
@@ -48,13 +75,13 @@ if __name__ == '__main__':
     
     # TODO(Jiayi): Most configs are hard-coded in yaml for now
     # Maybe they can be sent from vllm during init
-    vllm_config = yaml.safe_load(open("vllm_config.yaml"))
+    vllm_config = get_config_from_env()
     lmcache_config_file = "lmcache_config.yaml"
     
-    tp = vllm_config.get("tensor_model_parallel_size")
-    pp = vllm_config.get("pipeline_model_parallel_size")
+    tp = vllm_config.get("tp")
+    pp = vllm_config.get("pp")
     vllm_world_size = tp * pp
-    
+
     for vllm_rank in range(vllm_world_size):
         p = Process(target=init_lmc, args=(vllm_config, lmcache_config_file, vllm_rank, vllm_world_size))
         p.start()

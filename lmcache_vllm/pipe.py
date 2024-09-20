@@ -64,6 +64,7 @@ class TorchDistributedPipe:
         self.device_group = None
 
         for ranks in group_ranks:
+            logger.error("%s %s", ranks, torch_distributed_backend)
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend)
             if self.rank in ranks:
