@@ -41,13 +41,18 @@ def init_lmcache_engine(
         return 
 
     if "LMCACHE_CONFIG_FILE" not in os.environ:
-        logger.warn("No LMCache configuration file is set. Returning None")
+        logger.warn("No LMCache configuration file is set. Returning default config")
         logger.warn("Please set the configuration file through "
                     "the environment variable: LMCACHE_CONFIG_FILE")
-        return None
-
-    config_file = os.environ["LMCACHE_CONFIG_FILE"]
-    config = LMCacheEngineConfig.from_file(config_file)
+        config = LMCacheEngineConfig.from_defaults(
+                local_device = "cpu",
+                remote_url = None,
+                remote_serde = None,
+                pipelined_backend = False)
+    else:
+        config_file = os.environ["LMCACHE_CONFIG_FILE"]
+        logger.info(f"Loading LMCache config file {config_file}")
+        config = LMCacheEngineConfig.from_file(config_file)
 
     metadata = LMCacheEngineMetadata(
             model_config.model,

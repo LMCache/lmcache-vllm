@@ -8,7 +8,7 @@ from lmcache.logging import init_logger
 logger = init_logger(__name__)
 
 EXPECTED_VLLM_VERSION = "0.6.1.post2"
-__version__ = EXPECTED_VLLM_VERSION
+__version__ = "0.6.2"
 
 def check_library_version(library_name, required_version):
     try:
@@ -30,6 +30,7 @@ def check_library_version(library_name, required_version):
 
 def initialize_environment():
     # Check vllm and it's version
+    logger.info(f"Initializing lmcache_vllm version {__version__} for vllm {EXPECTED_VLLM_VERSION}")
     assert check_library_version("vllm", EXPECTED_VLLM_VERSION), f"vllm {EXPECTED_VLLM_VERSION} not found"
     InitLMCacheEnvironment()
 
