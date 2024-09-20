@@ -20,7 +20,6 @@ def init_comm(
     world_size = 2 * tensor_model_parallel_size * pipeline_model_parallel_size
     logger.info(f"Initialize lmc instance (rank {lmc_rank}) with {distributed_init_method}")
     
-    logger.info("%s %s %s %s", backend, distributed_init_method, world_size, lmc_rank)
     torch.distributed.init_process_group(
         backend=backend,
         init_method=distributed_init_method,
@@ -38,7 +37,6 @@ def init_comm(
 
     # initialize four pipes
     recv_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
-    logger.info("Cry!")
     recv_signal_pipe = TorchDistributedPipe(group_ranks, lmc_rank, "gloo")
     logger.info("LMCache recv pipe initialized!!!")
     
