@@ -25,22 +25,12 @@ class LMCVLLMDriver_V2:
         group_ranks: List[List[int]],
         cache_engine,
     ):
-        # vllm-related configs
-        self.start_layer = vllm_config.get("start_layer")
-        self.end_layer = vllm_config.get("end_layer")
-        self.num_layer = self.end_layer - self.start_layer
-        self.num_heads = vllm_config.get("num_heads")
-        self.head_size = vllm_config.get("head_size")
-        self.dtype = vllm_config.get("dtype")
-        if self.dtype == "float16":
-            self.dtype = torch.float16
-        self.hidden_size = vllm_config.get("hidden_size")
         
         # comm related configs
         # TODO (Jiayi): simplify the logic and remove hardcodes
         backend = vllm_config.get("backend")
-        tensor_model_parallel_size = vllm_config.get("tensor_model_parallel_size")
-        pipeline_model_parallel_size = vllm_config.get("pipeline_model_parallel_size")
+        tensor_model_parallel_size = vllm_config.get("tp")
+        pipeline_model_parallel_size = vllm_config.get("pp")
         distributed_init_method = vllm_config.get("distributed_init_method")
         
         # Init communications and crate pipes
