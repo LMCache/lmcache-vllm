@@ -13,11 +13,13 @@ from vllm.config import ModelConfig, ParallelConfig
 from lmcache.logging import init_logger
 from lmcache.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.config import LMCacheEngineConfig, LMCacheEngineMetadata
+from lmcache.utils import _lmcache_nvtx_annotate
 
 
 logger = init_logger(__name__)
 
 ENGINE_NAME = "vllm-instance"
+LMCACHE_CUDA_STREAM = torch.cuda.Stream()
 
 def init_lmcache_engine(
         model_config: ModelConfig,
@@ -141,6 +143,7 @@ def lmcache_should_store(
 
 
 
+@_lmcache_nvtx_annotate
 def lmcache_store_kv(
     model_executable: torch.nn.Module,
     model_input: "ModelInputForGPUWithSamplingMetadata",
@@ -160,7 +163,10 @@ def lmcache_store_kv(
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
     assert engine is not None, "LMCache engine is not initialized."
 
-    input_tokens_tensor = model_input.input_tokens
+
+    with torch.cuda.stream(LMCACHE_CUDA_STREAM):
+        input_tokens_tensor = model_input.input_tokens.detach().clone().cpu()
+
     seq_lens = model_input.attn_metadata.seq_lens
     slot_mapping_flat = model_input.attn_metadata.slot_mapping.flatten()
     if hasattr(model_executable.model, "start_layer"):
@@ -201,9 +207,10 @@ def lmcache_store_kv(
                 )
 
     
-        engine.store(current_tokens, tuple(kv_tuple_list))
+        engine.store(current_tokens.cpu(), tuple(kv_tuple_list), skip_existing = True, blocking = False)
 
 
+@_lmcache_nvtx_annotate
 def lmcache_retrieve_kv(
     model_executable,
     model_input: "ModelInputForGPUWithSamplingMetadata",
