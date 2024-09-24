@@ -8,7 +8,7 @@ if TYPE_CHECKING:
 
 from vllm import _custom_ops as ops
 from vllm.sequence import IntermediateTensors
-from vllm.config import ModelConfig, ParallelConfig
+from vllm.config import ModelConfig, ParallelConfig, CacheConfig
 
 from lmcache.logging import init_logger
 from lmcache.cache_engine import LMCacheEngine, LMCacheEngineBuilder
@@ -24,6 +24,7 @@ LMCACHE_CUDA_STREAM = torch.cuda.Stream()
 def init_lmcache_engine(
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
+        cache_config: CacheConfig,
     ) -> Optional[LMCacheEngine]:
     """Initialize the LMCache engine by the given model config and parallel 
     config. This function will check the environment variable 
@@ -34,6 +35,8 @@ def init_lmcache_engine(
     :type model_config: ModelConfig
     :param parallel_config: The parallel configuration in vLLM.
     :type parallel_config: ParallelConfig
+    :param cache_config: The KV cache configuration in vLLM.
+    :type cache_config: CacheConfig
 
     :return: The initialized LMCache engine or None (if the environment variable
         `LMCACHE_CONFIG_FILE` is not set).
@@ -60,7 +63,8 @@ def init_lmcache_engine(
             model_config.model,
             parallel_config.world_size,
             parallel_config.rank,
-            "vllm")
+            "vllm",
+            cache_config.cache_dtype)
     
     engine = LMCacheEngineBuilder.get_or_create(
             ENGINE_NAME,
