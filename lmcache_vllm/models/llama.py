@@ -1,5 +1,6 @@
 import torch
-from typing import Optional
+from typing import Optional, List
+from vllm.attention import AttentionMetadata
 
 from lmcache_vllm.blend_adapter import do_blend, process_new_request
 
@@ -31,9 +32,9 @@ def llama_model_forward_with_blend(
     positions: torch.Tensor,
     kv_caches: List[torch.Tensor],
     attn_metadata: AttentionMetadata,
-    intermediate_tensors: Optional[IntermediateTensors],
+    intermediate_tensors,
     inputs_embeds: Optional[torch.Tensor] = None,
-) -> Union[torch.Tensor, IntermediateTensors]:
+):
     attn_metadata = process_new_request(input_ids, positions, attn_metadata)
 
     if get_pp_group().is_first_rank:
