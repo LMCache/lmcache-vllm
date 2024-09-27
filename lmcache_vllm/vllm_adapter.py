@@ -267,7 +267,7 @@ def lmcache_retrieve_kv(
         input_tokens_list.append(current_tokens)
         start_pos_list.append(start_pos)
 
-        kv_tuple, num_computed_tokens = engine.retrive(current_tokens)
+        kv_tuple, num_computed_tokens = engine.retrieve(current_tokens)
 
         # Avoid the error when prefix is exactly the same as the retrieved
         if num_computed_tokens == num_tokens:
