@@ -13,6 +13,8 @@ from lmcache_vllm.vllm_adapter import (
         init_lmcache_engine, lmcache_should_store, lmcache_should_retrieve,
         lmcache_store_kv, lmcache_retrieve_kv, close_lmcache_engine)
 
+from lmcache_vllm.models.llama import inject_llama
+
 from lmcache.logging import init_logger
 logger = init_logger(__name__)
 
@@ -199,3 +201,5 @@ def InitLMCacheEnvironment() -> None:
 
     import vllm.engine.async_llm_engine
     vllm.engine.async_llm_engine._log_task_completion = new_log_task_completion
+    
+    inject_llama()
