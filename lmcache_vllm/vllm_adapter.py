@@ -93,7 +93,7 @@ def lmcache_should_retrieve(
     if not has_engine or kv_caches is None:
         return False
 
-    attn_meta = model_input.attn_metadata#.prefill_metadata
+    attn_meta = model_input.attn_metadata
     prefill_meta = attn_meta.prefill_metadata
     
     # check if the current run is profiling
@@ -101,7 +101,7 @@ def lmcache_should_retrieve(
     # check if the current run is prefill
     is_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
         and prefill_meta is not None)
-    #prefill_meta is not None
+
     # for disaggregated prefilling: allow bypassing model execution
 
     return all([
@@ -141,7 +141,7 @@ def lmcache_should_store(
     # FIXME(Jiayi): need to support multiple prefills in a single batch
     # check if the current run is prefill
     is_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
-        and (prefill_meta is not None)) #prefill_meta is not None
+        and (prefill_meta is not None))
 
 
     return all([
