@@ -264,7 +264,6 @@ def lmcache_retrieve_kv(
     # enumerate different requests
     # FIXME(Kuntai): This impl assumes that all requests are prefill.
     num_request_not_found = 0
-    num_request_decode = 0
     for idx, slen in enumerate(seq_lens):
 
         start_pos = sum(seq_lens[:idx])
@@ -283,7 +282,7 @@ def lmcache_retrieve_kv(
 
         if num_computed_tokens == 0:
             num_request_not_found += 1
-            #num_computed_tokens_list.append(0)
+            num_computed_tokens_list.append(0)
             continue
 
         num_computed_tokens_list.append(num_computed_tokens)
@@ -313,7 +312,9 @@ def lmcache_retrieve_kv(
             )
     
     # Some of the request can be skipped for a bit
-    if num_request_not_found == 0:#< len(seq_lens): 
+    # TODO(Jiayi): need to test full prefill and partial prefill
+    # in a single batch
+    if num_request_not_found < len(seq_lens): 
         rebuilt_model_input = build_partial_prefill_input(
             model_input,
             input_tokens_list,
