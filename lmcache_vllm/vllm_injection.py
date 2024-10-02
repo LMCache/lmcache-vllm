@@ -118,8 +118,11 @@ def new_execute_model(
  
     if not self.is_driver_worker:
         return []
- 
+
+    # Jiayi: this call back calls `_process_model_outputs`
+    # in vllm/engine/llm_engine.py
     if model_input.async_callback is not None:
+        #logger.debug(f"Model input after running: {model_input}")
         model_input.async_callback()
  
     # Sample the next token.
