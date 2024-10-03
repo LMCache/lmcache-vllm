@@ -93,12 +93,15 @@ def lmcache_should_retrieve(
     if not has_engine or kv_caches is None:
         return False
 
-    prefill_meta = model_input.attn_metadata.prefill_metadata
-
+    attn_meta = model_input.attn_metadata
+    prefill_meta = attn_meta.prefill_metadata
+    
     # check if the current run is profiling
     is_profile_run = (kv_caches is None) or (kv_caches[0] is None)
     # check if the current run is prefill
-    is_prefill_run = prefill_meta is not None
+    is_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
+        and prefill_meta is not None)
+
     # for disaggregated prefilling: allow bypassing model execution
 
     return all([
@@ -123,8 +126,9 @@ def lmcache_should_store(
     if not has_engine or kv_caches is None:
         return False
 
-    prefill_meta = model_input.attn_metadata.prefill_metadata
-
+    attn_meta = model_input.attn_metadata#.prefill_metadata
+    prefill_meta = attn_meta.prefill_metadata
+    
     # TODO (yihua): Current implementation is in GPUModelRunner, so we do
     #               not need to check the type of model_runner
     #from vllm.worker.model_runner import GPUModelRunnerBase
@@ -133,8 +137,11 @@ def lmcache_should_store(
 
     # check if the current run is profiling
     is_profile_run = (kv_caches is None) or (kv_caches[0] is None)
+    
+    # FIXME(Jiayi): need to support multiple prefills in a single batch
     # check if the current run is prefill
-    is_prefill_run = prefill_meta is not None
+    is_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
+        and (prefill_meta is not None))
 
 
     return all([
@@ -275,6 +282,7 @@ def lmcache_retrieve_kv(
 
         if num_computed_tokens == 0:
             num_request_not_found += 1
+            num_computed_tokens_list.append(0)
             continue
 
         num_computed_tokens_list.append(num_computed_tokens)
@@ -302,8 +310,11 @@ def lmcache_retrieve_kv(
                 layer.self_attn.attn._k_scale,
                 layer.self_attn.attn._v_scale,
             )
-
-    if num_request_not_found == 0: # All the request can be skipped for a bit
+    
+    # Some of the request can be skipped for a bit
+    # TODO(Jiayi): need to test full prefill and partial prefill
+    # in a single batch
+    if num_request_not_found < len(seq_lens): 
         rebuilt_model_input = build_partial_prefill_input(
             model_input,
             input_tokens_list,
@@ -314,7 +325,7 @@ def lmcache_retrieve_kv(
         )
         logger.debug("Rebuilt the input!")
         return rebuilt_model_input
-
+    
     logger.debug("Returning the original input!")
     return model_input
 
@@ -431,6 +442,7 @@ def build_partial_prefill_input(
         virtual_engine=model_input.virtual_engine,
         sampling_metadata=rebuilt_sampling_metadata,
         is_prompt=model_input.is_prompt,
+        async_callback=model_input.async_callback
     )
 
     return rebuilt_model_input

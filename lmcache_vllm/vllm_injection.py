@@ -118,7 +118,9 @@ def new_execute_model(
  
     if not self.is_driver_worker:
         return []
- 
+
+    # Jiayi: this call back calls `_process_model_outputs`
+    # in vllm/engine/llm_engine.py
     if model_input.async_callback is not None:
         model_input.async_callback()
  
