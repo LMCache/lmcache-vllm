@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 import os
 import torch
 from copy import deepcopy
+from torch.nn.utils.rnn import pad_sequence
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
@@ -126,7 +127,7 @@ def lmcache_should_store(
     if not has_engine or kv_caches is None:
         return False
 
-    attn_meta = model_input.attn_metadata#.prefill_metadata
+    attn_meta = model_input.attn_metadata
     prefill_meta = attn_meta.prefill_metadata
     
     # TODO (yihua): Current implementation is in GPUModelRunner, so we do
@@ -138,7 +139,7 @@ def lmcache_should_store(
     # check if the current run is profiling
     is_profile_run = (kv_caches is None) or (kv_caches[0] is None)
     
-    # FIXME(Jiayi): need to support multiple prefills in a single batch
+    # FIXME(Jiayi): need to support chunked prefill (batch prefill and decode)
     # check if the current run is prefill
     is_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
         and (prefill_meta is not None))
@@ -207,7 +208,7 @@ def lmcache_store_kv(
             value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
 
             current_slot_mapping = slot_mapping_flat[start_pos:end_pos]
-
+            
             kv_tuple_list.append(
                     (key_cache[current_slot_mapping],
                     value_cache[current_slot_mapping])
@@ -378,10 +379,10 @@ def build_partial_prefill_input(
         rebuilt_max_query_len = max(q_len, rebuilt_max_query_len)
         # TODO(Jiayi): remove hard-code (block_size=16)
         blk_size = 16
-        temp_block_table = [
-            slot_mapping_flat[i] // blk_size
-            for i in range(start_pos, start_pos + num_token, blk_size)
-        ]
+        temp_block_table = (
+            slot_mapping_flat[start_pos : start_pos + num_token : blk_size] 
+            // blk_size
+        ).to(model_input.attn_metadata.block_tables.dtype)
         rebuilt_block_tables.append(temp_block_table)
         rebuilt_query_start_loc.append(rebuilt_num_prefill_tokens)  #start with 0
         rebuilt_context_lens_tensor.append(num_computed_token)
@@ -398,10 +399,10 @@ def build_partial_prefill_input(
         rebuilt_slot_mapping).to(device)
     rebuilt_attn_metadata.max_query_len = rebuilt_max_query_len
 
-    rebuilt_attn_metadata.block_tables = torch.tensor(
+    rebuilt_attn_metadata.block_tables = pad_sequence(
         rebuilt_block_tables,
-        dtype=model_input.attn_metadata.block_tables.dtype).to(device)
-
+        batch_first=True
+        ).to(device)
     rebuilt_attn_metadata.query_start_loc = torch.tensor(
         rebuilt_query_start_loc,
         dtype=model_input.attn_metadata.query_start_loc.dtype).to(device)
