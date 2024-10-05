@@ -127,7 +127,7 @@ def lmcache_should_store(
     if not has_engine or kv_caches is None:
         return False
 
-    attn_meta = model_input.attn_metadata#.prefill_metadata
+    attn_meta = model_input.attn_metadata
     prefill_meta = attn_meta.prefill_metadata
     
     # TODO (yihua): Current implementation is in GPUModelRunner, so we do
