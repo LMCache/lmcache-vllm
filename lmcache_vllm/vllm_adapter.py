@@ -139,7 +139,7 @@ def lmcache_should_store(
     # check if the current run is profiling
     is_profile_run = (kv_caches is None) or (kv_caches[0] is None)
     
-    # FIXME(Jiayi): need to support multiple prefills in a single batch
+    # FIXME(Jiayi): need to support chunked prefill (batch prefill and decode)
     # check if the current run is prefill
     is_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
         and (prefill_meta is not None))
