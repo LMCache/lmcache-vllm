@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 from vllm import _custom_ops as ops
 from vllm.sequence import IntermediateTensors
 from vllm.config import ModelConfig, ParallelConfig
+from vllm.distributed import get_pp_group
 
 from lmcache.logging import init_logger
 from lmcache.cache_engine import LMCacheEngine, LMCacheEngineBuilder
@@ -112,7 +113,7 @@ def lmcache_should_retrieve(
 
 def lmcache_should_store(
         model_input: "ModelInputForGPUWithSamplingMetadata", 
-        kv_caches: List[torch.Tensor]) -> bool:
+        kv_caches: List[torch.Tensor]) -> str:
     """Check should we store KV into LMCache for the current model_input.
 
     :param model_input: The model input for the current request.
@@ -123,9 +124,10 @@ def lmcache_should_store(
 
     :return: True if we should store KV into LMCache, False otherwise.
     """
-    has_engine = LMCacheEngineBuilder.get(ENGINE_NAME) is not None
-    if not has_engine or kv_caches is None:
-        return False
+    engine = LMCacheEngineBuilder.get(ENGINE_NAME)
+    has_engine = engine is not None
+    if not has_engine:
+        return None
 
     attn_meta = model_input.attn_metadata
     prefill_meta = attn_meta.prefill_metadata
@@ -139,15 +141,26 @@ def lmcache_should_store(
     # check if the current run is profiling
     is_profile_run = (kv_caches is None) or (kv_caches[0] is None)
     
-    # FIXME(Jiayi): need to support chunked prefill (batch prefill and decode)
-    # check if the current run is prefill
-    is_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
-        and (prefill_meta is not None))
+    if is_profile_run:
+        return None
 
+    if not engine.save_decode_cache:
+        # FIXME(Jiayi): need to support chunked prefill (batch prefill and decode)
+        # check if the current run is prefill
+        is_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
+            and (prefill_meta is not None))
+        if prefill_run:
+            return "prefill"
+        return None
 
-    return all([
-        is_prefill_run, not is_profile_run, 
-    ])
+    
+    # Determine whether to save decoded KV cache
+    #seq_groups = model_input.sampling_metadata.seq_groups
+    seq_lens = model_input.attn_metadata.seq_lens
+    for seq_len in seq_lens:
+        if seq_len % 256 == 0:
+            return "decode"
+    return None
 
 
 
@@ -155,7 +168,8 @@ def lmcache_should_store(
 def lmcache_store_kv(
     model_executable: torch.nn.Module,
     model_input: "ModelInputForGPUWithSamplingMetadata",
-    kv_caches: List[torch.Tensor]
+    kv_caches: List[torch.Tensor],
+    is_prefill: bool = True,
 ) -> None:
     """Store the KV caches into LMCache for the current model_input.
 
@@ -176,7 +190,9 @@ def lmcache_store_kv(
         input_tokens_tensor = model_input.input_tokens.detach().clone().cpu()
 
     seq_lens = model_input.attn_metadata.seq_lens
-    slot_mapping_flat = model_input.attn_metadata.slot_mapping.flatten()
+    
+    if is_prefill:
+        slot_mapping_flat = model_input.attn_metadata.slot_mapping.flatten()
     if hasattr(model_executable.model, "start_layer"):
         start_layer = model_executable.model.start_layer
     else:
@@ -199,6 +215,21 @@ def lmcache_store_kv(
         keys, values = [], []
         kv_tuple_list = []
 
+        if is_prefill:
+            current_slot_mapping = slot_mapping_flat[start_pos:end_pos]
+        else:
+            # reconstruct slot_mapping
+            # TODO(Jiayi): remove hard-code (block_size=16)
+            if slen % engine.chunk_size == 0:
+                continue
+            blk_size = 16
+            block_table = model_input.attn_metadata.block_tables[idx]
+            current_slot_mapping = (block_table*16).unsqueeze(1) + \
+                torch.arange(blk_size)
+            current_slot_mapping = current_slot_mapping.flatten()
+            current_slot_mapping = current_slot_mapping_flat[:slen]
+            
+        
         for layer_id in range(start_layer, end_layer):
             kv_cache = kv_caches[layer_id - start_layer]
 
@@ -206,8 +237,6 @@ def lmcache_store_kv(
 
             key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
             value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
-
-            current_slot_mapping = slot_mapping_flat[start_pos:end_pos]
             
             kv_tuple_list.append(
                     (key_cache[current_slot_mapping],

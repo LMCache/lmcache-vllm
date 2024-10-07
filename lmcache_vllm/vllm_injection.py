@@ -91,9 +91,12 @@ def new_execute_model(
         model_forward_end.record()
 
     # LMCache storing
-    if lmcache_should_store(model_input, kv_caches):
-        lmcache_store_kv(model_executable, model_input, kv_caches)
- 
+    should_store = lmcache_should_store(model_input, kv_caches)
+    if should_store is not None:
+        is_prefill = (should_store == "prefill")
+        lmcache_store_kv(model_executable, model_input, kv_caches,
+                         is_prefill)
+
     # Compute the logits in the last pipeline stage.
     if not get_pp_group().is_last_rank:
         if (self.is_driver_worker
@@ -115,7 +118,8 @@ def new_execute_model(
  
     logits = self.model.compute_logits(hidden_or_intermediate_states,
                                        model_input.sampling_metadata)
- 
+
+    
     if not self.is_driver_worker:
         return []
 
@@ -129,6 +133,7 @@ def new_execute_model(
         logits=logits,
         sampling_metadata=model_input.sampling_metadata,
     )
+    
     if (self.observability_config is not None
             and self.observability_config.collect_model_forward_time
             and output is not None):
