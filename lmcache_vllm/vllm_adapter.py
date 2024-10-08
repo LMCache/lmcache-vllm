@@ -144,22 +144,22 @@ def lmcache_should_store(
     if is_profile_run:
         return None
 
-    if not engine.save_decode_cache:
-        # FIXME(Jiayi): need to support chunked prefill (batch prefill and decode)
-        # check if the current run is prefill
-        is_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
-            and (prefill_meta is not None))
-        if prefill_run:
-            return "prefill"
-        return None
+    # FIXME(Jiayi): need to support chunked prefill (batch prefill and decode)
+    # check if the current run is prefill
+    is_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
+        and (prefill_meta is not None))
+    if prefill_run:
+        return "prefill"
+    return None
 
     
     # Determine whether to save decoded KV cache
     #seq_groups = model_input.sampling_metadata.seq_groups
-    seq_lens = model_input.attn_metadata.seq_lens
-    for seq_len in seq_lens:
-        if seq_len % 256 == 0:
-            return "decode"
+    if engine.save_decode_cache:
+        seq_lens = model_input.attn_metadata.seq_lens
+        for seq_len in seq_lens:
+            if seq_len % 256 == 0:
+                return "decode"
     return None
 
 
