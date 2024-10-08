@@ -4,8 +4,10 @@ This version works with vllm-0.6.1.post2
 from functools import wraps
 import torch
 import asyncio
+from typing import Optional, List
 
 from vllm.multimodal import MultiModalInputs
+from vllm.lora.request import LoRARequest
 from vllm.worker.model_runner_base import dump_input_when_exception
 from vllm.distributed import get_pp_group
 
@@ -93,6 +95,8 @@ def new_execute_model(
     # LMCache storing
     should_store = lmcache_should_store(model_input, kv_caches)
     if should_store is not None:
+        assert should_store in ["prefill", "decode"]
+        logger.info(f"KV cache saving mode: {should_store}")
         is_prefill = (should_store == "prefill")
         lmcache_store_kv(model_executable, model_input, kv_caches,
                          is_prefill)
@@ -168,6 +172,57 @@ def new_execute_model(
  
     return [output]
 
+def _remove_empty_token(
+    tokenizer_id: str,
+    res: List[int],
+) -> List[int]:
+    """
+    remove empty tokens to enable caching decode KV cache
+    """
+    mistral_family = ['mistralai/Mistral-7B-Instruct-v0.2']
+    if tokenizer_id in mistral_family:
+        empty_token = 28705
+        res = [x for x in res if x != empty_token]
+    return res
+
+def _new_tokenize_prompt(
+    self,
+    prompt: str,
+    request_id: str,
+    lora_request: Optional[LoRARequest],
+) -> List[int]:
+    """
+    Apply the model's tokenizer to a text prompt, returning the
+    corresponding token IDs.
+    """
+    tokenizer = self.get_tokenizer_group()
+
+    res = tokenizer.encode(request_id=request_id,
+                            prompt=prompt,
+                            lora_request=lora_request)
+    
+    # Jiayi: Patch starts here
+    tokenizer_id = tokenizer.tokenizer_id
+    res = _remove_empty_token(tokenizer_id, res)
+    return res
+
+async def _new_tokenize_prompt_async(
+    self,
+    prompt: str,
+    request_id: str,
+    lora_request: Optional[LoRARequest],
+) -> List[int]:
+    """Async version of :meth:`_tokenize_prompt`."""
+    tokenizer = self.get_tokenizer_group()
+
+    res = await tokenizer.encode_async(request_id=request_id,
+                                        prompt=prompt,
+                                        lora_request=lora_request)
+    
+    # Jiayi: Patch starts here
+    tokenizer_id = tokenizer.tokenizer_id
+    res = _remove_empty_token(tokenizer_id, res)
+    return res
 
 def new_log_task_completion(task: asyncio.Task,
                             error_callback) -> None:
@@ -201,8 +256,14 @@ def new_log_task_completion(task: asyncio.Task,
 def InitLMCacheEnvironment() -> None:
     """Initialize the LMCache environment.
     """
+    
     import vllm.worker.model_runner 
     vllm.worker.model_runner.ModelRunner.execute_model = new_execute_model
 
     import vllm.engine.async_llm_engine
     vllm.engine.async_llm_engine._log_task_completion = new_log_task_completion
+    
+    import vllm
+    vllm.inputs.preprocess.InputPreprocessor._tokenize_prompt = _new_tokenize_prompt
+    vllm.inputs.preprocess.InputPreprocessor._tokenize_prompt_async = _new_tokenize_prompt_async
+    

@@ -193,6 +193,10 @@ def lmcache_store_kv(
     
     if is_prefill:
         slot_mapping_flat = model_input.attn_metadata.slot_mapping.flatten()
+    else:
+        slot_mapping_dtype = model_input.attn_metadata.slot_mapping[0].dtype
+        slot_mapping_device = model_input.attn_metadata.slot_mapping[0].device
+        
     if hasattr(model_executable.model, "start_layer"):
         start_layer = model_executable.model.start_layer
     else:
@@ -208,27 +212,37 @@ def lmcache_store_kv(
     # FIXME(Kuntai): This assume that all requests are prefill, which may not
     #                work for chunked prefill
     for idx, slen in enumerate(seq_lens):
-        start_pos = sum(seq_lens[:idx])
-        end_pos = start_pos + slen
-        current_tokens = input_tokens_tensor[start_pos:end_pos]
 
         keys, values = [], []
         kv_tuple_list = []
 
         if is_prefill:
+            start_pos = sum(seq_lens[:idx])
+            end_pos = start_pos + slen
+            current_tokens = input_tokens_tensor[start_pos:end_pos]
             current_slot_mapping = slot_mapping_flat[start_pos:end_pos]
         else:
+            if slen % engine.chunk_size != 0:
+                continue
+            
+            # reconstruct current_tokens
+            seq_data = model_input.sampling_metadata.seq_groups[idx].seq_data[0]
+            prompt_tokens = seq_data.prompt_token_ids
+            output_tokens = seq_data.output_token_ids
+            current_tokens = torch.tensor(prompt_tokens+output_tokens)
+            
+            assert len(current_tokens) == slen
+            
             # reconstruct slot_mapping
             # TODO(Jiayi): remove hard-code (block_size=16)
-            if slen % engine.chunk_size == 0:
-                continue
             blk_size = 16
             block_table = model_input.attn_metadata.block_tables[idx]
             current_slot_mapping = (block_table*16).unsqueeze(1) + \
-                torch.arange(blk_size)
+                torch.arange(blk_size, device=slot_mapping_device)
             current_slot_mapping = current_slot_mapping.flatten()
-            current_slot_mapping = current_slot_mapping_flat[:slen]
-            
+            current_slot_mapping = current_slot_mapping[:slen]
+            current_slot_mapping = current_slot_mapping.to(slot_mapping_dtype)
+            print(f"store: {current_tokens}")
         
         for layer_id in range(start_layer, end_layer):
             kv_cache = kv_caches[layer_id - start_layer]
@@ -300,6 +314,9 @@ def lmcache_retrieve_kv(
         end_pos = start_pos + slen
         current_tokens = input_tokens_tensor[start_pos:end_pos]
         num_tokens = slen
+        
+        if len(current_tokens) >= 1024:
+            print(f"retrieve: {current_tokens[:768]}")
 
         input_tokens_list.append(current_tokens)
         start_pos_list.append(start_pos)
