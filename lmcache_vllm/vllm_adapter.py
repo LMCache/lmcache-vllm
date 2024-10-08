@@ -157,7 +157,7 @@ def lmcache_should_store(
     if engine.save_decode_cache:
         seq_lens = model_input.attn_metadata.seq_lens
         for seq_len in seq_lens:
-            if seq_len % 256 == 0:
+            if seq_len % engine.chunk_size == 0:
                 return "decode"
     return None
 
