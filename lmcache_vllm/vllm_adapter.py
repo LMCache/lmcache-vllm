@@ -150,7 +150,6 @@ def lmcache_should_store(
         and (prefill_meta is not None))
     if prefill_run:
         return "prefill"
-    return None
 
     
     # Determine whether to save decoded KV cache
