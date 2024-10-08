@@ -1,4 +1,5 @@
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from enum import Enum
 import os
 import torch
 from copy import deepcopy
@@ -22,6 +23,11 @@ logger = init_logger(__name__)
 
 ENGINE_NAME = "vllm-instance"
 LMCACHE_CUDA_STREAM = torch.cuda.Stream()
+
+class StoreStatus(Enum):
+    PREFILL = 1
+    DECODE = 2
+    NONE = 3
 
 def init_lmcache_engine(
         model_config: ModelConfig,
@@ -113,7 +119,7 @@ def lmcache_should_retrieve(
 
 def lmcache_should_store(
         model_input: "ModelInputForGPUWithSamplingMetadata", 
-        kv_caches: List[torch.Tensor]) -> str:
+        kv_caches: List[torch.Tensor]) -> StoreStatus:
     """Check should we store KV into LMCache for the current model_input.
 
     :param model_input: The model input for the current request.
@@ -127,7 +133,7 @@ def lmcache_should_store(
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
     has_engine = engine is not None
     if not has_engine:
-        return None
+        return StoreStatus.NONE
 
     attn_meta = model_input.attn_metadata
     prefill_meta = attn_meta.prefill_metadata
@@ -142,14 +148,14 @@ def lmcache_should_store(
     is_profile_run = (kv_caches is None) or (kv_caches[0] is None)
     
     if is_profile_run:
-        return None
+        return StoreStatus.NONE
 
     # FIXME(Jiayi): need to support chunked prefill (batch prefill and decode)
     # check if the current run is prefill
     is_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
         and (prefill_meta is not None))
-    if prefill_run:
-        return "prefill"
+    if is_prefill_run:
+        return StoreStatus.PREFILL
 
     
     # Determine whether to save decoded KV cache
@@ -158,8 +164,8 @@ def lmcache_should_store(
         seq_lens = model_input.attn_metadata.seq_lens
         for seq_len in seq_lens:
             if seq_len % engine.chunk_size == 0:
-                return "decode"
-    return None
+                return StoreStatus.DECODE
+    return StoreStatus.NONE
 
 
 
@@ -225,7 +231,9 @@ def lmcache_store_kv(
                 continue
             
             # reconstruct current_tokens
-            seq_data = model_input.sampling_metadata.seq_groups[idx].seq_data[0]
+            # FIXME (Jiayi): need to know when there are mutiple seq_data
+            key = list(model_input.sampling_metadata.seq_groups[idx].seq_data.keys())[0]
+            seq_data = model_input.sampling_metadata.seq_groups[idx].seq_data[key]
             prompt_tokens = seq_data.prompt_token_ids
             output_tokens = seq_data.output_token_ids
             current_tokens = torch.tensor(prompt_tokens+output_tokens)

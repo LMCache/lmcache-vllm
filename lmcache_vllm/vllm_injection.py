@@ -13,7 +13,8 @@ from vllm.distributed import get_pp_group
 
 from lmcache_vllm.vllm_adapter import (
         init_lmcache_engine, lmcache_should_store, lmcache_should_retrieve,
-        lmcache_store_kv, lmcache_retrieve_kv, close_lmcache_engine)
+        lmcache_store_kv, lmcache_retrieve_kv, close_lmcache_engine,
+        StoreStatus)
 
 from lmcache.logging import init_logger
 logger = init_logger(__name__)
@@ -94,10 +95,10 @@ def new_execute_model(
 
     # LMCache storing
     should_store = lmcache_should_store(model_input, kv_caches)
-    if should_store is not None:
-        assert should_store in ["prefill", "decode"]
+    if should_store != StoreStatus.NONE:
+        assert should_store in [StoreStatus.PREFILL, StoreStatus.DECODE]
         logger.info(f"KV cache saving mode: {should_store}")
-        is_prefill = (should_store == "prefill")
+        is_prefill = (should_store == StoreStatus.PREFILL)
         lmcache_store_kv(model_executable, model_input, kv_caches,
                          is_prefill)
 
