@@ -241,7 +241,6 @@ def lmcache_store_kv(
             current_slot_mapping = current_slot_mapping.flatten()
             current_slot_mapping = current_slot_mapping[:slen]
             current_slot_mapping = current_slot_mapping.to(slot_mapping_dtype)
-            print(f"store: {current_tokens}")
         
         for layer_id in range(start_layer, end_layer):
             kv_cache = kv_caches[layer_id - start_layer]
@@ -313,9 +312,6 @@ def lmcache_retrieve_kv(
         end_pos = start_pos + slen
         current_tokens = input_tokens_tensor[start_pos:end_pos]
         num_tokens = slen
-        
-        if len(current_tokens) >= 1024:
-            print(f"retrieve: {current_tokens[:768]}")
 
         input_tokens_list.append(current_tokens)
         start_pos_list.append(start_pos)
