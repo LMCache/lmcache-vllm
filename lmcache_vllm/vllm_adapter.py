@@ -128,7 +128,8 @@ def lmcache_should_store(
     :param kv_caches: The paged memory
     :type kv_caches: List[torch.Tensor]
 
-    :return: True if we should store KV into LMCache, False otherwise.
+    :return: StoreStatus.PREFILL/DECODE if we should store KV after PREFILL/DECODE.
+             StoreStatus.NONE if no storing is required.
     """
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
     has_engine = engine is not None
