@@ -1,6 +1,8 @@
 import torch
 from typing import Optional, List
 from vllm.attention import AttentionMetadata
+from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size)
 
 from lmcache_vllm.blend_adapter import do_blend, process_new_request
 
@@ -35,7 +37,7 @@ def llama_model_forward_with_blend(
     intermediate_tensors,
     inputs_embeds: Optional[torch.Tensor] = None,
 ):
-    attn_metadata = process_new_request(input_ids, positions, attn_metadata)
+    attn_metadata = process_new_request(input_ids, positions, attn_metadata, kv_caches)
 
     if get_pp_group().is_first_rank:
         if inputs_embeds is not None:

@@ -3,6 +3,7 @@ import importlib
 
 from lmcache_vllm.vllm_injection import InitLMCacheEnvironment
 from lmcache_vllm.vllm_adapter import close_lmcache_engine
+import lmcache_vllm.blend_adapter as blend_adapter
 
 from lmcache.logging import init_logger
 logger = init_logger(__name__)

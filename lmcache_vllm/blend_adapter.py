@@ -1,5 +1,5 @@
 import torch
-from typing import Tuple
+from typing import Tuple, List
 from dataclasses import dataclass
 
 from lmcache.cache_engine import LMCacheEngineBuilder
@@ -58,10 +58,16 @@ def pre_initialize():
     global_blend_retriever = SPTBlendRetriever(TEMP_SPT, cache_engine, cache_engine.metadata)
 
 def should_process_request(
-        attn_metadata: AttentionMetadata
+        attn_metadata: AttentionMetadata,
+        kv_caches: List[torch.Tensor],
     ) -> bool:
+    is_profile_run = (kv_caches is None) or (kv_caches[0] is None)
+    if is_profile_run:
+        return False
+
     has_prefill = attn_metadata.prefill_metadata is not None
     has_decode = attn_metadata.decode_metadata is not None
+
     if has_prefill and has_decode:
         logger.warning("CacheBlend does not support prefill and decode at the same time")
     return has_prefill and not has_decode
@@ -69,11 +75,12 @@ def should_process_request(
 def process_new_request(
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        attn_metadata: AttentionMetadata
+        attn_metadata: AttentionMetadata,
+        kv_caches: List[torch.Tensor],
     ) -> AttentionMetadata:
     """Creates the cacheblend related stuff and put that into the attn metadata
     """
-    if not should_process_request(attn_metadata):
+    if not should_process_request(attn_metadata, kv_caches):
         return attn_metadata
 
     cache_engine = LMCacheEngineBuilder.get(ENGINE_NAME)
@@ -83,7 +90,9 @@ def process_new_request(
         raise RuntimeError("Cannot initialize cache blend logic because LMCacheEngine is not initialized")
 
     global global_blend_retriever
-    task = global_blend_retriever.new_request(input_ids, attn_metadata.query_start_loc)
+    if global_blend_retriever is None:
+        pre_initialize()
+    task = global_blend_retriever.new_request(input_ids.cpu(), attn_metadata.query_start_loc)
     executor = CacheBlendImpl(RECOMP_RATIO)
     blend_metadata = BlendMetadata(0, positions, task, executor)
     setattr(attn_metadata, "blend_metadata", blend_metadata)
@@ -109,12 +118,12 @@ def do_blend(
         # Do nothing
         return fresh_q, fresh_k, fresh_v, attn_metadata
 
-    # FIXME: Temp for autocomplete
-    blend_metadata = BlendMetadata()
-
     # Retrieve the KV
     layer_id = blend_metadata.processed_layer_count
     retrieved_kv = blend_metadata.retrieval_task.result(layer_id)
+    if retrieved_kv.k is None or retrieved_kv.v is None:
+        # Do nothing if no KV is retrieved
+        return fresh_q, fresh_k, fresh_v, attn_metadata
 
     # blend the KV
     blender_output = blend_metadata.blend_executor.blend(
@@ -153,4 +162,4 @@ def do_blend(
 
         # context lens: won't change
 
-    return attn_metadata
+    return fresh_q, fresh_k, fresh_v, attn_metadata
