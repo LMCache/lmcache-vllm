@@ -36,6 +36,7 @@ class RetrieveStatus(Enum):
     CHUNK_PREFILL_LAST = 3
     NONE = 4
 
+
 def init_lmcache_engine(
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
@@ -169,6 +170,7 @@ def lmcache_should_store(
     if not has_engine:
         return store_status
 
+
     attn_meta = model_input.attn_metadata
     prefill_meta = attn_meta.prefill_metadata
     
@@ -184,11 +186,11 @@ def lmcache_should_store(
     if is_profile_run:
         return store_status
 
-
     # FIXME(Jiayi): need to support chunked prefill (batch prefill and decode)
     # check if the current run is prefill
     is_all_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
         and (prefill_meta is not None))
+
     if is_all_prefill_run:
         selected_token_indices = model_input.sampling_metadata.selected_token_indices
         if len(selected_token_indices) == 0:
@@ -204,6 +206,7 @@ def lmcache_should_store(
     #seq_groups = model_input.sampling_metadata.seq_groups
     if engine.save_decode_cache:
         seq_lens = model_input.attn_metadata.seq_lens
+
         for idx, seq_len in enumerate(seq_lens):
             if seq_len % engine.chunk_size == 0:
                 store_status[idx] = StoreStatus.DECODE
@@ -229,6 +232,7 @@ def reconstruct_slot_mapping(
     current_slot_mapping = current_slot_mapping[:slen]
     current_slot_mapping = current_slot_mapping.to(slot_mapping_dtype)
     return current_slot_mapping
+
 
 @_lmcache_nvtx_annotate
 def lmcache_store_kv(
@@ -263,6 +267,7 @@ def lmcache_store_kv(
     slot_mapping_flat = None
     slot_mapping_dtype = model_input.attn_metadata.slot_mapping[0].dtype
     slot_mapping_device = model_input.attn_metadata.slot_mapping[0].device
+
         
     if hasattr(model_executable.model, "start_layer"):
         start_layer = model_executable.model.start_layer
@@ -279,6 +284,7 @@ def lmcache_store_kv(
     # FIXME(Kuntai): This assume that all requests are prefill, which may not
     #                work for chunked prefill
     for idx, slen in enumerate(seq_lens):
+
         status = store_status[idx]
         
         keys, values = [], []
@@ -291,6 +297,7 @@ def lmcache_store_kv(
             end_pos = start_pos + slen
             current_tokens = input_tokens_tensor[start_pos:end_pos]
             current_slot_mapping = slot_mapping_flat[start_pos:end_pos]
+            
         elif status == StoreStatus.CHUNK_PREFILL:
             assert idx == 0 # chunk prefill bsz is 1
             
@@ -305,6 +312,7 @@ def lmcache_store_kv(
                 model_input, idx, slen, slot_mapping_device, slot_mapping_dtype)
             
         elif status == StoreStatus.DECODE:
+
             if slen % engine.chunk_size != 0:
                 continue
             
@@ -322,7 +330,7 @@ def lmcache_store_kv(
             # reconstruct slot_mapping
             current_slot_mapping = reconstruct_slot_mapping(
                 model_input, idx, slen, slot_mapping_device, slot_mapping_dtype)
-        
+  
         for layer_id in range(start_layer, end_layer):
             kv_cache = kv_caches[layer_id - start_layer]
 

@@ -118,6 +118,7 @@ def new_execute_model(
     else:
         hidden_or_intermediate_states = self.hidden_or_intermediate_states_fake
 
+
     # Compute the logits in the last pipeline stage.
     if not get_pp_group().is_last_rank:
         if (self.is_driver_worker
@@ -273,7 +274,6 @@ def new_log_task_completion(task: asyncio.Task,
 def InitLMCacheEnvironment() -> None:
     """Initialize the LMCache environment.
     """
-
     import vllm.worker.model_runner 
     vllm.worker.model_runner.ModelRunner.execute_model = new_execute_model
 
@@ -283,5 +283,4 @@ def InitLMCacheEnvironment() -> None:
     import vllm
     vllm.inputs.preprocess.InputPreprocessor._tokenize_prompt = _new_tokenize_prompt
     vllm.inputs.preprocess.InputPreprocessor._tokenize_prompt_async = _new_tokenize_prompt_async
-
     
