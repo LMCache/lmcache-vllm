@@ -183,19 +183,6 @@ def lmcache_store_kv(
     """
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
     assert engine is not None, "LMCache engine is not initialized."
-
-
-    with torch.cuda.stream(LMCACHE_CUDA_STREAM):
-        input_tokens_tensor = model_input.input_tokens.detach().clone().cpu()
-
-    seq_lens = model_input.attn_metadata.seq_lens
-    
-    if is_prefill:
-        slot_mapping_flat = model_input.attn_metadata.slot_mapping.flatten()
-    else:
-        slot_mapping_dtype = model_input.attn_metadata.slot_mapping[0].dtype
-        slot_mapping_device = model_input.attn_metadata.slot_mapping[0].device
-        
     if hasattr(model_executable.model, "start_layer"):
         start_layer = model_executable.model.start_layer
     else:
@@ -206,59 +193,50 @@ def lmcache_store_kv(
     else:
         end_layer = len(kv_caches)
 
-    # query_lens contains new KV caches that are added to vLLM.
-    # so we will send them to decode instance
-    # FIXME(Kuntai): This assume that all requests are prefill, which may not
-    #                work for chunked prefill
-    for idx, slen in enumerate(seq_lens):
+    seq_group_metadata_list = model_input.seq_group_metadata_list
+    for seq_group_metadata in seq_group_metadata_list:
+        for seqid, seq_data in seq_group_metadata.seq_data.items():
+            save_this_seq = False
+            seq_len = seq_data.get_len()
+            if seq_group_metadata.is_prompt:
+                assert is_prefill
+                save_this_seq = True
+            else:
+                assert not is_prefill
+                save_this_seq = seq_len % engine.chunk_size == 0
+            if save_this_seq:
+                if seq_group_metadata.is_prompt:
+                    assert len(seq_group_metadata.seq_data) == 1
+                # Do store.
+                current_tokens = torch.tensor(seq_data.get_token_ids(), device="cpu")
+                assert len(current_tokens) == seq_len
+                skip_leading_tokens = 0 # Now do not skip.
+                if skip_leading_tokens < seq_len:
+                    assert skip_leading_tokens % engine.chunk_size == 0
+                    from vllm.attention.backends.utils import compute_slot_mapping
+                    slot_mapping = []
+                    # FIXME: Hard coded 16
+                    compute_slot_mapping(False, slot_mapping, seqid, seq_len, 
+                                                                0, skip_leading_tokens, 16, seq_group_metadata.block_tables)
+                    current_slot_mapping = slot_mapping[skip_leading_tokens:]
+                    kv_tuple_list = []
+                    for layer_id in range(start_layer, end_layer):
+                        kv_cache = kv_caches[layer_id - start_layer]
 
-        keys, values = [], []
-        kv_tuple_list = []
+                        _, _, num_heads, head_size = kv_cache[0].shape
 
-        if is_prefill:
-            start_pos = sum(seq_lens[:idx])
-            end_pos = start_pos + slen
-            current_tokens = input_tokens_tensor[start_pos:end_pos]
-            current_slot_mapping = slot_mapping_flat[start_pos:end_pos]
-        else:
-            if slen % engine.chunk_size != 0:
-                continue
-            
-            # reconstruct current_tokens
-            # FIXME (Jiayi): need to know when there are mutiple seq_data
-            key = list(model_input.sampling_metadata.seq_groups[idx].seq_data.keys())[0]
-            seq_data = model_input.sampling_metadata.seq_groups[idx].seq_data[key]
-            prompt_tokens = seq_data.prompt_token_ids
-            output_tokens = seq_data.output_token_ids
-            current_tokens = torch.tensor(prompt_tokens+output_tokens)
-            
-            assert len(current_tokens) == slen
-            
-            # reconstruct slot_mapping
-            # TODO(Jiayi): remove hard-code (block_size=16)
-            blk_size = 16
-            block_table = model_input.attn_metadata.block_tables[idx]
-            current_slot_mapping = (block_table*16).unsqueeze(1) + \
-                torch.arange(blk_size, device=slot_mapping_device)
-            current_slot_mapping = current_slot_mapping.flatten()
-            current_slot_mapping = current_slot_mapping[:slen]
-            current_slot_mapping = current_slot_mapping.to(slot_mapping_dtype)
-        
-        for layer_id in range(start_layer, end_layer):
-            kv_cache = kv_caches[layer_id - start_layer]
+                        key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
+                        value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
 
-            _, _, num_heads, head_size = kv_cache[0].shape
 
-            key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
-            value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
-            
-            kv_tuple_list.append(
-                    (key_cache[current_slot_mapping],
-                    value_cache[current_slot_mapping])
-                )
-
-    
-        engine.store(current_tokens.cpu(), tuple(kv_tuple_list), skip_existing = True, blocking = False)
+                        kv_tuple_list.append(
+                                (key_cache[current_slot_mapping],
+                                value_cache[current_slot_mapping])
+                            )
+                    assert skip_leading_tokens == 0
+                    logger.debug(f"Store skips {skip_leading_tokens} and then stores {seq_len - skip_leading_tokens}")
+                    engine.store(current_tokens.cpu(), tuple(kv_tuple_list), 
+                                skip_existing = True, blocking = False)
 
 
 @_lmcache_nvtx_annotate
@@ -335,17 +313,18 @@ def lmcache_retrieve_kv(
                 # 1. Retrieve
                 kv_tuple, num_retrieved_tokens = engine.retrieve(full_token_tensor)
                 # Then skip.
-                new_kv_list = []
-                for kv_layer in kv_tuple:
-                    key_tensor: torch.Tensor = kv_layer[0]
-                    value_tensor: torch.Tensor = kv_layer[1]
-                    new_key_tensor = key_tensor[skip_leading_tokens:].contiguous()
-                    new_value_tensor = value_tensor[skip_leading_tokens:].contiguous()
-                    new_kv_list.append((new_key_tensor, new_value_tensor))
-                kv_tuple = tuple(new_kv_list)
-                num_retrieved_tokens -= skip_leading_tokens
-                logger.debug(f"num_retrieved_tokens: {num_retrieved_tokens}")
-                if num_retrieved_tokens > 0:
+                if num_retrieved_tokens > skip_leading_tokens:
+                    new_kv_list = []
+                    for kv_layer in kv_tuple:
+                        key_tensor: torch.Tensor = kv_layer[0]
+                        value_tensor: torch.Tensor = kv_layer[1]
+                        new_key_tensor = key_tensor[skip_leading_tokens:].contiguous()
+                        new_value_tensor = value_tensor[skip_leading_tokens:].contiguous()
+                        new_kv_list.append((new_key_tensor, new_value_tensor))
+                    kv_tuple = tuple(new_kv_list)
+                    num_retrieved_tokens -= skip_leading_tokens
+                    logger.debug(f"num_retrieved_tokens: {num_retrieved_tokens}")
+                    assert num_retrieved_tokens > 0
                     # 2. Inject
                     for i in range(start_layer, end_layer):
                         layer_idx = i - start_layer
@@ -368,6 +347,7 @@ def lmcache_retrieve_kv(
                     num_computed_tokens_list.append(new_num_computed_tokens)
                     more_tokens_hit_list.append(new_num_computed_tokens - skip_leading_tokens) # Can be zero.
                 else:
+                    logger.debug(f"num_retrieved_tokens: 0")
                     num_request_not_found += 1
                     num_computed_tokens_list.append(skip_leading_tokens)
                     more_tokens_hit_list.append(0)
