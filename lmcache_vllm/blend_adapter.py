@@ -16,7 +16,7 @@ logger = init_logger(__name__)
 
 # TODO: need to load the special token and recompute ratio from configuration
 TEMP_SPT = torch.tensor([422], dtype = torch.int, device = "cpu")
-RECOMP_RATIO = 0.15
+RECOMP_RATIO = 0.0
 global_blend_retriever = None
 
 @dataclass
@@ -40,11 +40,22 @@ class BlendMetadata:
         current request
     :ivar BlendExecutor blend_executor: The blend executor for the current
         request
+    :ivar torch.Tensor selected_token_indices: will be used to update the 
+        sampling_metadata after model.forward
     """
     processed_layer_count: int
     positions: torch.Tensor
     retrieval_task: BlendRetrieverTask
     blend_executor: BlendExecutor
+    selected_token_indices: torch.Tensor
+
+def convert_retrieved_kv_shape(k_or_v: torch.Tensor) -> torch.Tensor:
+    """Convert the retrieved KV layer shape to [num_tokens, hidden_dims]
+    """
+    tmp = k_or_v.squeeze()
+    assert tmp.dim() == 3 # Should be [num_tokens, num_heads, head_size]
+    nt, nh, hs = tmp.shape
+    return tmp.reshape((nt, nh * hs))
 
 def pre_initialize():
     cache_engine = LMCacheEngineBuilder.get(ENGINE_NAME)
@@ -58,11 +69,16 @@ def pre_initialize():
     global_blend_retriever = SPTBlendRetriever(TEMP_SPT, cache_engine, cache_engine.metadata)
 
 def should_process_request(
+        input_ids: torch.Tensor,
         attn_metadata: AttentionMetadata,
         kv_caches: List[torch.Tensor],
     ) -> bool:
     is_profile_run = (kv_caches is None) or (kv_caches[0] is None)
     if is_profile_run:
+        return False
+
+    # TODO: make this "256" be configurable
+    if len(input_ids) < 256:
         return False
 
     has_prefill = attn_metadata.prefill_metadata is not None
@@ -80,7 +96,7 @@ def process_new_request(
     ) -> AttentionMetadata:
     """Creates the cacheblend related stuff and put that into the attn metadata
     """
-    if not should_process_request(attn_metadata, kv_caches):
+    if not should_process_request(input_ids, attn_metadata, kv_caches):
         return attn_metadata
 
     cache_engine = LMCacheEngineBuilder.get(ENGINE_NAME)
@@ -94,7 +110,7 @@ def process_new_request(
         pre_initialize()
     task = global_blend_retriever.new_request(input_ids.cpu(), attn_metadata.query_start_loc)
     executor = CacheBlendImpl(RECOMP_RATIO)
-    blend_metadata = BlendMetadata(0, positions, task, executor)
+    blend_metadata = BlendMetadata(0, positions, task, executor, None)
     setattr(attn_metadata, "blend_metadata", blend_metadata)
     return attn_metadata
 
@@ -126,10 +142,12 @@ def do_blend(
         return fresh_q, fresh_k, fresh_v, attn_metadata
 
     # blend the KV
+    rk = convert_retrieved_kv_shape(retrieved_kv.k)
+    rv = convert_retrieved_kv_shape(retrieved_kv.v)
     blender_output = blend_metadata.blend_executor.blend(
             layer_id,
-            retrieved_kv.k,
-            retrieved_kv.v,
+            rk,
+            rv,
             retrieved_kv.valid_mask,
             fresh_q,
             fresh_k,
@@ -146,12 +164,10 @@ def do_blend(
     if fresh_q.shape != blender_output.q.shape:
         # num_prefills: not change
 
-        # num_prefill_tokens
+        # num_prefill_tokens 
         attn_metadata.num_prefill_tokens = len(blender_output.positions)
 
-        # slot mapping
-        old_slot_mapping = attn_metadata.slot_mapping.clone()
-        attn_metadata.slot_mapping = attn_metadata.slot_mapping[blender_output.local_indices]
+        # slot mapping: don't change slot_mapping because it's for KV
 
         # TODO: we should consider changing max_query_len
 
@@ -162,4 +178,8 @@ def do_blend(
 
         # context lens: won't change
 
-    return fresh_q, fresh_k, fresh_v, attn_metadata
+        # selected_token_indices:
+        new_selected_token_indices = blender_output.query_start_loc[1:].clone() - 1
+        attn_metadata.blend_metadata.selected_token_indices = new_selected_token_indices
+
+    return blender_output.q, blender_output.k, blender_output.v, attn_metadata

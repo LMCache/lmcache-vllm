@@ -96,6 +96,14 @@ def new_execute_model(
     if lmcache_should_store(model_input, kv_caches):
         lmcache_store_kv(model_executable, model_input, kv_caches)
  
+    if hasattr(model_input.attn_metadata, "blend_metadata") and\
+            model_input.attn_metadata.blend_metadata.selected_token_indices is not None:
+        new_selected_token_indices = \
+                model_input.attn_metadata.blend_metadata.selected_token_indices
+        model_input.sampling_metadata.selected_token_indices = \
+                new_selected_token_indices
+        logger.info(f"Updating selected_token_indices to {new_selected_token_indices} after blending")
+
     # Compute the logits in the last pipeline stage.
     if not get_pp_group().is_last_rank:
         if (self.is_driver_worker
