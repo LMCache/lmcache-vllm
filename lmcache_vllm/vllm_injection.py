@@ -28,7 +28,7 @@ def new_execute_model(
     intermediate_tensors,
     num_steps: int = 1,
 ): 
-    init_lmcache_engine(self.model_config, self.parallel_config)
+    init_lmcache_engine(self.model_config, self.parallel_config, self.cache_config)
 
     # LMCache retrieval
     if lmcache_should_retrieve(model_input, kv_caches):
@@ -96,11 +96,10 @@ def new_execute_model(
     # LMCache storing
     should_store = lmcache_should_store(model_input, kv_caches)
     if should_store != StoreStatus.NONE:
-        assert should_store in [StoreStatus.PREFILL, StoreStatus.DECODE]
+        assert should_store in [StoreStatus.PREFILL, StoreStatus.DECODE, StoreStatus.MIXED]
         logger.info(f"KV cache saving mode: {should_store}")
-        is_prefill = (should_store == StoreStatus.PREFILL)
         lmcache_store_kv(model_executable, model_input, kv_caches,
-                         is_prefill)
+                         should_store)
 
     # Compute the logits in the last pipeline stage.
     if not get_pp_group().is_last_rank:
@@ -254,12 +253,35 @@ def new_log_task_completion(task: asyncio.Task,
             "actual cause.") from e
 
 
+original_prepare_model_input = None
+def wrap_prepare_model_input(
+        self,
+        seq_group_metadata_list,
+        virtual_engine: int = 0,
+        finished_requests_ids: Optional[List[str]] = None,
+    ):
+    global original_prepare_model_input
+    model_input = original_prepare_model_input(
+        self, seq_group_metadata_list, virtual_engine, finished_requests_ids)
+    import dataclasses
+    # NOTE(Sixian): Use seq_group_metadata_list because sampling_metadata is only available 
+    # at the last stage of pipeline parallelism stages.
+    # NOTE: Assuming model_input tokens in the same order as seq_group_metadata_list
+    # And do not full hit.
+    return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
+
+
 def InitLMCacheEnvironment() -> None:
     """Initialize the LMCache environment.
     """
     
     import vllm.worker.model_runner 
     vllm.worker.model_runner.ModelRunner.execute_model = new_execute_model
+
+    import vllm.worker.model_runner
+    global original_prepare_model_input
+    original_prepare_model_input = vllm.worker.model_runner.ModelRunner.prepare_model_input
+    vllm.worker.model_runner.ModelRunner.prepare_model_input = wrap_prepare_model_input
 
     import vllm.engine.async_llm_engine
     vllm.engine.async_llm_engine._log_task_completion = new_log_task_completion
