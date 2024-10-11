@@ -71,7 +71,7 @@ def init_lmcache_engine(
         config_file = os.environ["LMCACHE_CONFIG_FILE"]
         logger.info(f"Loading LMCache config file {config_file}")
         config = LMCacheEngineConfig.from_file(config_file)
-
+    
     metadata = LMCacheEngineMetadata(
             model_config.model,
             parallel_config.world_size,
@@ -197,6 +197,14 @@ def lmcache_should_store(
             # There should only be 1 chunk in chunked prefill
             assert len(seq_lens) == 1
             return [StoreStatus.CHUNK_PREFILL]
+        key = list(model_input.sampling_metadata.seq_groups[0].seq_data.keys())[0]
+        seq_data = model_input.sampling_metadata.seq_groups[0].seq_data[key]
+        prompt_tokens = seq_data.prompt_token_ids
+        
+        if len(prompt_tokens)-1 != selected_token_indices[0]:
+            # last chunk in chunk prefill
+            assert len(seq_lens) == 1
+            return [StoreStatus.NONE]
         return [StoreStatus.PREFILL] * len(seq_lens)
         
        
@@ -437,7 +445,7 @@ def lmcache_retrieve_kv(
         
         if retrieve_status == RetrieveStatus.CHUNK_PREFILL:
             assert idx == 0 # only one prefill in chunk prefill
-            if num_computed_tokens != num_tokens:
+            if num_computed_tokens != len(input_tokens_tensor):
                 logger.debug("Chunk prefill last chunk not handled! Returning the original input!")
                 return model_input, False
         else:

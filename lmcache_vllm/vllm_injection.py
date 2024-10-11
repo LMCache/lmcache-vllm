@@ -35,17 +35,18 @@ def new_execute_model(
     is_skip = False
     if retrieve_status != RetrieveStatus.NONE:
         logger.info(f"KV cache retrieving mode: {retrieve_status}")
-        logger.debug(f"{model_input.seq_lens}")
         model_input, is_skip = lmcache_retrieve_kv(
             self.model, model_input, kv_caches, retrieve_status)
-        
+
         if is_skip: # create a hiddens_states
+            logger.debug("Prefill is entirely skipped")
             num_tok = len(model_input.input_tokens)
             num_dim = self.model.model.embed_tokens.embedding_dim
-            self.hidden_or_intermediate_states_fake = \
-                torch.ones(num_tok, num_dim, 
-                           device=model_input.input_tokens.device,
-                           dtype=self.model.model.embed_tokens.weight.dtype)
+            if not hasattr(self, 'hidden_or_intermediate_states_fake'):
+                self.hidden_or_intermediate_states_fake = \
+                    torch.ones(num_tok, num_dim, 
+                            device=model_input.input_tokens.device,
+                            dtype=self.model.model.embed_tokens.weight.dtype)
             
     
     # TODO(Jiayi): Currently, we do not handle the last chunk in chunk prefill
