@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional
 from enum import Enum
 import os
 import torch
@@ -9,9 +9,8 @@ if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
 
 from vllm import _custom_ops as ops
-from vllm.sequence import IntermediateTensors
-from vllm.config import ModelConfig, ParallelConfig
-from vllm.distributed import get_pp_group
+from vllm.sequence import SequenceGroupMetadata
+from vllm.config import ModelConfig, ParallelConfig, CacheConfig
 
 from lmcache.logging import init_logger
 from lmcache.cache_engine import LMCacheEngine, LMCacheEngineBuilder
@@ -29,9 +28,12 @@ class StoreStatus(Enum):
     DECODE = 2
     NONE = 3
 
+vllm_block_size = None
+
 def init_lmcache_engine(
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
+        cache_config: CacheConfig,
     ) -> Optional[LMCacheEngine]:
     """Initialize the LMCache engine by the given model config and parallel 
     config. This function will check the environment variable 
@@ -42,6 +44,8 @@ def init_lmcache_engine(
     :type model_config: ModelConfig
     :param parallel_config: The parallel configuration in vLLM.
     :type parallel_config: ParallelConfig
+    :param cache_config: The cache configuration in vLLM.
+    :type cache_config: CacheConfig
 
     :return: The initialized LMCache engine or None (if the environment variable
         `LMCACHE_CONFIG_FILE` is not set).
@@ -50,6 +54,8 @@ def init_lmcache_engine(
     if LMCacheEngineBuilder.get(ENGINE_NAME) is not None:
         return 
 
+    global vllm_block_size
+    vllm_block_size = cache_config.block_size
     if "LMCACHE_CONFIG_FILE" not in os.environ:
         logger.warn("No LMCache configuration file is set. Returning default config")
         logger.warn("Please set the configuration file through "
@@ -215,9 +221,8 @@ def lmcache_store_kv(
                     assert skip_leading_tokens % engine.chunk_size == 0
                     from vllm.attention.backends.utils import compute_slot_mapping
                     slot_mapping = []
-                    # FIXME: Hard coded 16
                     compute_slot_mapping(False, slot_mapping, seqid, seq_len, 
-                                                                0, skip_leading_tokens, 16, seq_group_metadata.block_tables)
+                                                                0, skip_leading_tokens, vllm_block_size, seq_group_metadata.block_tables)
                     current_slot_mapping = slot_mapping[skip_leading_tokens:]
                     kv_tuple_list = []
                     for layer_id in range(start_layer, end_layer):
@@ -323,7 +328,7 @@ def lmcache_retrieve_kv(
                         new_kv_list.append((new_key_tensor, new_value_tensor))
                     kv_tuple = tuple(new_kv_list)
                     num_retrieved_tokens -= skip_leading_tokens
-                    logger.debug(f"num_retrieved_tokens: {num_retrieved_tokens}")
+                    logger.debug(f"Injected token number: {num_retrieved_tokens}")
                     assert num_retrieved_tokens > 0
                     # 2. Inject
                     for i in range(start_layer, end_layer):
@@ -347,7 +352,7 @@ def lmcache_retrieve_kv(
                     num_computed_tokens_list.append(new_num_computed_tokens)
                     more_tokens_hit_list.append(new_num_computed_tokens - skip_leading_tokens) # Can be zero.
                 else:
-                    logger.debug(f"num_retrieved_tokens: 0")
+                    logger.debug(f"Injected token number: 0")
                     num_request_not_found += 1
                     num_computed_tokens_list.append(skip_leading_tokens)
                     more_tokens_hit_list.append(0)
@@ -395,7 +400,7 @@ def build_partial_prefill_input(
     slot_mapping_flat: torch.Tensor,
     more_tokens_hit_list: List[int],
     is_prefill_list: List[bool],
-    seq_group_metadata_list,
+    seq_group_metadata_list: List[SequenceGroupMetadata],
     temp_block_table_list: List[List[int]],
     device: torch.device,
 ) -> "ModelInputForGPUWithSamplingMetadata":

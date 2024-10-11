@@ -28,7 +28,7 @@ def new_execute_model(
     intermediate_tensors,
     num_steps: int = 1,
 ): 
-    init_lmcache_engine(self.model_config, self.parallel_config)
+    init_lmcache_engine(self.model_config, self.parallel_config, self.cache_config)
 
     # LMCache retrieval
     if lmcache_should_retrieve(model_input, kv_caches):
@@ -260,11 +260,15 @@ def wrap_prepare_model_input(
         virtual_engine: int = 0,
         finished_requests_ids: Optional[List[str]] = None,
     ):
+    """Wrap prepare_model_input to put seq_group_metadata_list
+    into model_input.
+    """
     global original_prepare_model_input
     model_input = original_prepare_model_input(
         self, seq_group_metadata_list, virtual_engine, finished_requests_ids)
     import dataclasses
-    # NOTE(Sixian): Use seq_group_metadata_list because sampling_metadata is only available 
+    # NOTE(Sixian): Use seq_group_metadata_list because
+    # sampling_metadata is only available
     # at the last stage of pipeline parallelism stages.
     return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
 
