@@ -26,8 +26,15 @@ LMCACHE_CUDA_STREAM = torch.cuda.Stream()
 
 class StoreStatus(Enum):
     PREFILL = 1
-    DECODE = 2
-    NONE = 3
+    CHUNK_PREFILL = 2
+    DECODE = 3
+    NONE = 4
+
+class RetrieveStatus(Enum):
+    PREFILL = 1
+    CHUNK_PREFILL = 2 # not last chunk
+    CHUNK_PREFILL_LAST = 3
+    NONE = 4
 
 def init_lmcache_engine(
         model_config: ModelConfig,
@@ -85,7 +92,7 @@ def close_lmcache_engine() -> None:
 
 def lmcache_should_retrieve(
         model_input: "ModelInputForGPUWithSamplingMetadata", 
-        kv_caches: List[torch.Tensor]) -> bool:
+        kv_caches: List[torch.Tensor]) -> RetrieveStatus:
     """Check should we retrieve KV from LMCache for the current model_input.
 
     :param model_input: The model input for the current request.
@@ -94,27 +101,50 @@ def lmcache_should_retrieve(
     :param kv_caches: The paged memory
     :type kv_caches: List[torch.Tensor]
 
-    :return: True if we should retrieve KV from LMCache, False otherwise.
+    :return: RetrieveStatus.
     """
 
+    seq_lens = model_input.attn_metadata.seq_lens
+    
     has_engine = LMCacheEngineBuilder.get(ENGINE_NAME) is not None
     if not has_engine or kv_caches is None:
-        return False
+        return RetrieveStatus.NONE
 
     attn_meta = model_input.attn_metadata
     prefill_meta = attn_meta.prefill_metadata
     
     # check if the current run is profiling
     is_profile_run = (kv_caches is None) or (kv_caches[0] is None)
+    if is_profile_run:
+        return RetrieveStatus.NONE
+    
     # check if the current run is prefill
-    is_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
+    # TODO (Jiayi): chunked prefill + prefix caching in a single batch
+    # is not and should not be supported here
+    # what about multuple chunk prefills in a single batch??
+    
+    # Assume all chunks are prefills
+    is_all_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
         and prefill_meta is not None)
+    if is_all_prefill_run:
+        selected_token_indices = model_input.sampling_metadata.selected_token_indices
+        if len(selected_token_indices) == 0:
+            # There should only be 1 chunk in chunked prefill
+            assert len(model_input.seq_lens) == 1
+            return RetrieveStatus.CHUNK_PREFILL
+        
+        # Check whether the current prefill chunk is the last one
+        key = list(model_input.sampling_metadata.seq_groups[0].seq_data.keys())[0]
+        seq_data = model_input.sampling_metadata.seq_groups[0].seq_data[key]
+        prompt_tokens = seq_data.prompt_token_ids
+        if model_input.seq_lens[0] != len(prompt_tokens):
+            #TODO(Jiayi): We should support this as well
+            return RetrieveStatus.CHUNK_PREFILL_LAST
+        return RetrieveStatus.PREFILL
 
     # for disaggregated prefilling: allow bypassing model execution
 
-    return all([
-        is_prefill_run, not is_profile_run
-    ])
+    return RetrieveStatus.NONE
 
 
 def lmcache_should_store(
@@ -128,13 +158,16 @@ def lmcache_should_store(
     :param kv_caches: The paged memory
     :type kv_caches: List[torch.Tensor]
 
-    :return: StoreStatus.PREFILL/DECODE if we should store KV after PREFILL/DECODE.
+    :return: A list of StoreStatus.
+             StoreStatus.PREFILL/DECODE if we should store KV after PREFILL/DECODE.
              StoreStatus.NONE if no storing is required.
     """
+    seq_lens = model_input.attn_metadata.seq_lens
+    store_status = [StoreStatus.NONE] * len(seq_lens)
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
     has_engine = engine is not None
     if not has_engine:
-        return StoreStatus.NONE
+        return store_status
 
     attn_meta = model_input.attn_metadata
     prefill_meta = attn_meta.prefill_metadata
@@ -149,33 +182,60 @@ def lmcache_should_store(
     is_profile_run = (kv_caches is None) or (kv_caches[0] is None)
     
     if is_profile_run:
-        return StoreStatus.NONE
+        return store_status
+
 
     # FIXME(Jiayi): need to support chunked prefill (batch prefill and decode)
     # check if the current run is prefill
-    is_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
+    is_all_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
         and (prefill_meta is not None))
-    if is_prefill_run:
-        return StoreStatus.PREFILL
+    if is_all_prefill_run:
+        selected_token_indices = model_input.sampling_metadata.selected_token_indices
+        if len(selected_token_indices) == 0:
+            # There should only be 1 chunk in chunked prefill
+            assert len(seq_lens) == 1
+            return [StoreStatus.CHUNK_PREFILL]
+        return [StoreStatus.PREFILL] * len(seq_lens)
+        
+       
 
     
     # Determine whether to save decoded KV cache
     #seq_groups = model_input.sampling_metadata.seq_groups
     if engine.save_decode_cache:
         seq_lens = model_input.attn_metadata.seq_lens
-        for seq_len in seq_lens:
+        for idx, seq_len in enumerate(seq_lens):
             if seq_len % engine.chunk_size == 0:
-                return StoreStatus.DECODE
-    return StoreStatus.NONE
+                store_status[idx] = StoreStatus.DECODE
+    return store_status
 
-
+def reconstruct_slot_mapping(
+    model_input: "ModelInputForGPUWithSamplingMetadata",
+    idx: int,
+    slen: int,
+    slot_mapping_device: torch.device,
+    slot_mapping_dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Reconstruct slotmapping from block tables
+    """
+    # reconstruct slot_mapping
+    # TODO(Jiayi): remove hard-code (block_size=16)
+    blk_size = 16
+    block_table = model_input.attn_metadata.block_tables[idx]
+    current_slot_mapping = (block_table*16).unsqueeze(1) + \
+        torch.arange(blk_size, device=slot_mapping_device)
+    current_slot_mapping = current_slot_mapping.flatten()
+    current_slot_mapping = current_slot_mapping[:slen]
+    current_slot_mapping = current_slot_mapping.to(slot_mapping_dtype)
+    return current_slot_mapping
 
 @_lmcache_nvtx_annotate
 def lmcache_store_kv(
     model_executable: torch.nn.Module,
     model_input: "ModelInputForGPUWithSamplingMetadata",
     kv_caches: List[torch.Tensor],
-    is_prefill: bool = True,
+    store_status: List[StoreStatus],
 ) -> None:
     """Store the KV caches into LMCache for the current model_input.
 
@@ -187,6 +247,9 @@ def lmcache_store_kv(
 
     :param kv_caches: The paged memory to get KV from
     :type kv_caches: List[torch.Tensor]
+    
+    :param store_status: Indicate whether and how KV cache of each req is stored
+    :type store_status: List[StoreStatus]
     """
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
     assert engine is not None, "LMCache engine is not initialized."
@@ -197,11 +260,9 @@ def lmcache_store_kv(
 
     seq_lens = model_input.attn_metadata.seq_lens
     
-    if is_prefill:
-        slot_mapping_flat = model_input.attn_metadata.slot_mapping.flatten()
-    else:
-        slot_mapping_dtype = model_input.attn_metadata.slot_mapping[0].dtype
-        slot_mapping_device = model_input.attn_metadata.slot_mapping[0].device
+    slot_mapping_flat = None
+    slot_mapping_dtype = model_input.attn_metadata.slot_mapping[0].dtype
+    slot_mapping_device = model_input.attn_metadata.slot_mapping[0].device
         
     if hasattr(model_executable.model, "start_layer"):
         start_layer = model_executable.model.start_layer
@@ -218,21 +279,38 @@ def lmcache_store_kv(
     # FIXME(Kuntai): This assume that all requests are prefill, which may not
     #                work for chunked prefill
     for idx, slen in enumerate(seq_lens):
-
+        status = store_status[idx]
+        
         keys, values = [], []
         kv_tuple_list = []
 
-        if is_prefill:
+        if status == StoreStatus.PREFILL:
+            if slot_mapping_flat is None:
+                slot_mapping_flat = model_input.attn_metadata.slot_mapping.flatten()
             start_pos = sum(seq_lens[:idx])
             end_pos = start_pos + slen
             current_tokens = input_tokens_tensor[start_pos:end_pos]
             current_slot_mapping = slot_mapping_flat[start_pos:end_pos]
-        else:
+        elif status == StoreStatus.CHUNK_PREFILL:
+            assert idx == 0 # chunk prefill bsz is 1
+            
+            # reconstruct current_tokens
+            key = list(model_input.sampling_metadata.seq_groups[idx].seq_data.keys())[0]
+            seq_data = model_input.sampling_metadata.seq_groups[idx].seq_data[key]
+            prompt_tokens = seq_data.prompt_token_ids
+            current_tokens = torch.tensor(prompt_tokens[:slen])
+            
+             # reconstruct slot_mapping
+            current_slot_mapping = reconstruct_slot_mapping(
+                model_input, idx, slen, slot_mapping_device, slot_mapping_dtype)
+            
+        elif status == StoreStatus.DECODE:
             if slen % engine.chunk_size != 0:
                 continue
             
             # reconstruct current_tokens
             # FIXME (Jiayi): need to know when there are mutiple seq_data
+            # beam search is enabled if multiple seq_data
             key = list(model_input.sampling_metadata.seq_groups[idx].seq_data.keys())[0]
             seq_data = model_input.sampling_metadata.seq_groups[idx].seq_data[key]
             prompt_tokens = seq_data.prompt_token_ids
@@ -242,14 +320,8 @@ def lmcache_store_kv(
             assert len(current_tokens) == slen
             
             # reconstruct slot_mapping
-            # TODO(Jiayi): remove hard-code (block_size=16)
-            blk_size = 16
-            block_table = model_input.attn_metadata.block_tables[idx]
-            current_slot_mapping = (block_table*16).unsqueeze(1) + \
-                torch.arange(blk_size, device=slot_mapping_device)
-            current_slot_mapping = current_slot_mapping.flatten()
-            current_slot_mapping = current_slot_mapping[:slen]
-            current_slot_mapping = current_slot_mapping.to(slot_mapping_dtype)
+            current_slot_mapping = reconstruct_slot_mapping(
+                model_input, idx, slen, slot_mapping_device, slot_mapping_dtype)
         
         for layer_id in range(start_layer, end_layer):
             kv_cache = kv_caches[layer_id - start_layer]
@@ -272,8 +344,9 @@ def lmcache_store_kv(
 def lmcache_retrieve_kv(
     model_executable,
     model_input: "ModelInputForGPUWithSamplingMetadata",
-    kv_caches: List[torch.Tensor]
-) -> "ModelInputForGPUWithSamplingMetadata":
+    kv_caches: List[torch.Tensor],
+    retrieve_status: RetrieveStatus,
+) -> Tuple["ModelInputForGPUWithSamplingMetadata", bool]:
     """Retrieve the KV caches from LMCache for the current model_input. And 
     rebuild the model_input to reflect the changes in KV if necessary.
 
@@ -286,11 +359,18 @@ def lmcache_retrieve_kv(
     :param kv_caches: The paged memory to put KV to
     :type kv_caches: List[torch.Tensor]
 
+    :param retrieve_status: Indicate whether and how KV cache of each req is retrieved
+    :type retrieve_status: List[RetrieveStatus]
+    
     :return: The rebuilt model_input to reflect the changes in KV.
+    :return: The boolean value to indicate whether the entire execute_model should be skipped
     """
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
     assert engine is not None, "LMCache engine is not initialized."
 
+    # TODO(Jiayi): need to handle chunk prefill
+    
+    
     # This is disagg decode instance, during prefill state
     # Need to receive KV from the prefill instance
     input_tokens_tensor = model_input.input_tokens
@@ -319,27 +399,48 @@ def lmcache_retrieve_kv(
 
         start_pos = sum(seq_lens[:idx])
         end_pos = start_pos + slen
-        current_tokens = input_tokens_tensor[start_pos:end_pos]
         num_tokens = slen
 
-        input_tokens_list.append(current_tokens)
-        start_pos_list.append(start_pos)
 
-        kv_tuple, num_computed_tokens = engine.retrieve(current_tokens)
+        token_mask = None
+        if retrieve_status == RetrieveStatus.CHUNK_PREFILL:
+            key = list(model_input.sampling_metadata.seq_groups[idx].seq_data.keys())[0]
+            seq_data = model_input.sampling_metadata.seq_groups[idx].seq_data[key]
+            prompt_tokens = seq_data.prompt_token_ids
+            current_tokens = torch.tensor(prompt_tokens[:slen])
+            token_mask = torch.ones_like(current_tokens, dtype=torch.bool)
+            token_mask[:-len(input_tokens_tensor)] = False
+            
+        else:
+            current_tokens = input_tokens_tensor[start_pos:end_pos]
+            input_tokens_list.append(current_tokens)
+            start_pos_list.append(start_pos)
 
-        # Avoid the error when prefix is exactly the same as the retrieved
-        if num_computed_tokens == num_tokens:
-            num_computed_tokens -= 1
+            
+        kv_tuple, num_computed_tokens = engine.retrieve(
+            current_tokens, mask=token_mask)
 
+        # No cache found, move on
         if num_computed_tokens == 0:
             num_request_not_found += 1
             num_computed_tokens_list.append(0)
             continue
+        
+        
+        if retrieve_status == RetrieveStatus.CHUNK_PREFILL:
+            assert idx == 0 # only one prefill in chunk prefill
+            if num_computed_tokens != num_tokens:
+                logger.debug("Chunk prefill last chunk not handled! Returning the original input!")
+                return model_input, False
+        else:
+            end_pos = start_pos + num_computed_tokens
+            # Avoid the error when prefix is exactly the same as the retrieved
+            if num_computed_tokens == num_tokens:
+                num_computed_tokens -= 1
+            
 
         num_computed_tokens_list.append(num_computed_tokens)
-        #is_complete = (num_computed_tokens == num_tokens)
-        end_pos = start_pos + num_computed_tokens
-
+        
         # receive KV cache from disaggregated prefill instance
         # TODO: this depends on model_executable has the following attributes
         # - model.layers -- list of Layer
@@ -362,6 +463,10 @@ def lmcache_retrieve_kv(
                 layer.self_attn.attn._v_scale,
             )
     
+    if retrieve_status == RetrieveStatus.CHUNK_PREFILL and \
+        num_request_not_found == 0:
+        return model_input, True    
+        
     # Some of the request can be skipped for a bit
     # TODO(Jiayi): need to test full prefill and partial prefill
     # in a single batch
@@ -375,10 +480,10 @@ def lmcache_retrieve_kv(
             device=kv_cache[0].device,
         )
         logger.debug("Rebuilt the input!")
-        return rebuilt_model_input
+        return rebuilt_model_input, False
     
     logger.debug("Returning the original input!")
-    return model_input
+    return model_input, False
 
 def build_partial_prefill_input(
     model_input: "ModelInputForGPUWithSamplingMetadata",
