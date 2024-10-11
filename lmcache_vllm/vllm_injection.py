@@ -266,8 +266,6 @@ def wrap_prepare_model_input(
     import dataclasses
     # NOTE(Sixian): Use seq_group_metadata_list because sampling_metadata is only available 
     # at the last stage of pipeline parallelism stages.
-    # NOTE: Assuming model_input tokens in the same order as seq_group_metadata_list
-    # And do not full hit.
     return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
 
 

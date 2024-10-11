@@ -303,7 +303,6 @@ def lmcache_retrieve_kv(
             seq_len = seq_data.get_len()
             slen = query_start_loc[idx + 1] - query_start_loc[idx]
             start_pos = next_start_pos
-            # start_pos is the place in slot_mapping
             end_pos = start_pos + slen
             next_start_pos = end_pos
             temp_block_table = deepcopy(seq_group_metadata.block_tables[seq_id])
@@ -311,8 +310,6 @@ def lmcache_retrieve_kv(
             full_token_tensor = torch.tensor(seq_data.get_token_ids(), device="cpu")
             full_tokens_list.append(full_token_tensor)
             start_pos_list.append(start_pos)
-            # slen is the tokens needing computation by only vllm.
-            # NOTE(Sixian): Assuming no sliding window here.
             skip_leading_tokens = seq_len - slen
             assert skip_leading_tokens >= 0
             if seq_group_metadata.is_prompt:
@@ -324,8 +321,6 @@ def lmcache_retrieve_kv(
                 kv_tuple, num_retrieved_tokens = engine.retrieve(full_token_tensor, skip_leading_tokens)
                 logger.debug(f"num_retrieved_tokens: {num_retrieved_tokens}")
                 if num_retrieved_tokens > 0:
-                    # Inject first, even inject the one token which can be substracted.
-                    # Inject everything retrieved.
                     # 2. Inject
                     for i in range(start_layer, end_layer):
                         layer_idx = i - start_layer
@@ -393,10 +388,10 @@ def build_partial_prefill_input(
     num_computed_tokens_list: List[int],
     start_pos_list: List[int],
     slot_mapping_flat: torch.Tensor,
-    more_tokens_hit_list,
+    more_tokens_hit_list: List[int],
     is_prefill_list: List[bool],
     seq_group_metadata_list,
-    temp_block_table_list,
+    temp_block_table_list: List[List[int]],
     device: torch.device,
 ) -> "ModelInputForGPUWithSamplingMetadata":
     """Helper function to rebuild the model input for the current request.
@@ -455,7 +450,7 @@ def build_partial_prefill_input(
         rebuilt_context_lens_tensor.append(num_computed_token)
 
         # Sampling metadata related
-        #seq_groups (use rebuilt query lens)
+        # seq_groups (use rebuilt query lens)
         # TODO(Sixian): Check selected_token_indices.
         rebuilt_selected_token_indices.append(last_query_start_loc - 1)
 
