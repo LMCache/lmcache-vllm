@@ -411,7 +411,6 @@ def build_partial_prefill_input(
     rebuilt_query_lens = []
     rebuilt_num_prefills = 0
     rebuilt_num_prefill_tokens = 0
-    rebuilt_num_decode_tokens = 0
     rebuilt_slot_mapping = []
     rebuilt_max_query_len = 0
 
@@ -445,7 +444,6 @@ def build_partial_prefill_input(
             rebuilt_num_prefill_tokens += q_len
         else:
             assert q_len == 1
-            rebuilt_num_decode_tokens += q_len
         
         start_slot_idx = start_pos + more_tokens_hit
         end_slot_idx = start_slot_idx + q_len
@@ -468,7 +466,6 @@ def build_partial_prefill_input(
     rebuilt_attn_metadata = deepcopy(model_input.attn_metadata)
     rebuilt_attn_metadata.num_prefills = rebuilt_num_prefills
     rebuilt_attn_metadata.num_prefill_tokens = rebuilt_num_prefill_tokens
-    rebuilt_attn_metadata.num_decode_tokens = rebuilt_num_decode_tokens
     rebuilt_attn_metadata.slot_mapping = torch.cat(
         rebuilt_slot_mapping).to(device)
     rebuilt_attn_metadata.max_query_len = rebuilt_max_query_len
