@@ -8,7 +8,6 @@ import asyncio
 from vllm.multimodal import MultiModalInputs
 from vllm.worker.model_runner_base import dump_input_when_exception
 from vllm.distributed import get_pp_group
-from vllm.utils import get_kv_cache_torch_dtype
 
 from lmcache_vllm.vllm_adapter import (
         init_lmcache_engine, lmcache_should_store, lmcache_should_retrieve,
@@ -16,19 +15,6 @@ from lmcache_vllm.vllm_adapter import (
 
 from lmcache.logging import init_logger
 logger = init_logger(__name__)
-
-TORCH_DTYPE_TO_STR_DTYPE = {
-    torch.half: "half",
-    torch.float16: "half",
-    torch.bfloat16: "bfloat16",
-    torch.float: "float",
-    torch.float32: "float",
-    torch.float64: "double",
-    torch.double: "double",
-    torch.uint8: "fp8",
-    torch.float8_e4m3fn: "fp8_e4m3", 
-    torch.float8_e5m2: "fp8_e5m2",
-}
 
 @torch.inference_mode()
 @dump_input_when_exception(exclude_args=[0], exclude_kwargs=["self"])
@@ -39,12 +25,6 @@ def new_execute_model(
     intermediate_tensors,
     num_steps: int = 1,
 ): 
-    # If KV cache's dtype is "auto", enforce it to be the same with model's dtype
-    if self.cache_config.cache_dtype == "auto":
-        kv_cache_type = get_kv_cache_torch_dtype(self.cache_config.cache_dtype,
-                                                 self.model_config.dtype)
-        self.cache_config.cache_dtype = TORCH_DTYPE_TO_STR_DTYPE[kv_cache_type]
-    
     init_lmcache_engine(self.model_config, self.parallel_config, self.cache_config)
 
     # LMCache retrieval
