@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="lmcache_vllm",
-    version="0.6.2",
+    version="0.6.2.1",
     description = "lmcache_vllm: LMCache's wrapper for vllm",
     author = "LMCache team",
     author_email = "lmcacheteam@gmail.com",

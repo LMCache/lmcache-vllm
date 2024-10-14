@@ -8,7 +8,7 @@ from lmcache.logging import init_logger
 logger = init_logger(__name__)
 
 EXPECTED_VLLM_VERSION = "0.6.1.post2"
-__version__ = "0.6.2"
+__version__ = "0.6.2.1"
 
 def check_library_version(library_name, required_version):
     try:
