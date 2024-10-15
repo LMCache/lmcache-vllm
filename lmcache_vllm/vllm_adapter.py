@@ -316,20 +316,14 @@ def lmcache_retrieve_kv(
                 logger.debug(f"Tokens assigned to compute by vllm: {slen}")
                 logger.debug(f"full token length: {seq_len}")
                 # 1. Retrieve
-                kv_tuple, num_retrieved_tokens = engine.retrieve(full_token_tensor)
+                mask_tensor = torch.ones_like(full_token_tensor, dtype=torch.bool)
+                mask_tensor[:skip_leading_tokens] = False
+                kv_tuple, ret_mask_tensor = engine.retrieve(full_token_tensor, mask_tensor)
+                # Assuming that the False in mask will never be returned.
+                num_extra_tokens = torch.sum(ret_mask_tensor).item()
                 # Then skip.
-                if num_retrieved_tokens > skip_leading_tokens:
-                    new_kv_list = []
-                    for kv_layer in kv_tuple:
-                        key_tensor: torch.Tensor = kv_layer[0]
-                        value_tensor: torch.Tensor = kv_layer[1]
-                        new_key_tensor = key_tensor[skip_leading_tokens:].contiguous()
-                        new_value_tensor = value_tensor[skip_leading_tokens:].contiguous()
-                        new_kv_list.append((new_key_tensor, new_value_tensor))
-                    kv_tuple = tuple(new_kv_list)
-                    num_retrieved_tokens -= skip_leading_tokens
-                    logger.debug(f"Injected token number: {num_retrieved_tokens}")
-                    assert num_retrieved_tokens > 0
+                if num_extra_tokens > 0:
+                    logger.debug(f"Injected token number: {num_extra_tokens}")
                     # 2. Inject
                     for i in range(start_layer, end_layer):
                         layer_idx = i - start_layer
@@ -341,12 +335,12 @@ def lmcache_retrieve_kv(
                             kv_tuple[layer_idx][1].to(value_cache.device),
                             key_cache,
                             value_cache,
-                            slot_mapping[start_pos:start_pos + num_retrieved_tokens],
+                            slot_mapping[start_pos:start_pos + num_extra_tokens],
                             layer.self_attn.attn.kv_cache_dtype,
                             layer.self_attn.attn._k_scale,
                             layer.self_attn.attn._v_scale,
                         )
-                    new_num_computed_tokens = skip_leading_tokens + num_retrieved_tokens
+                    new_num_computed_tokens = skip_leading_tokens + num_extra_tokens
                     if new_num_computed_tokens == seq_len:
                         new_num_computed_tokens -= 1
                     num_computed_tokens_list.append(new_num_computed_tokens)
