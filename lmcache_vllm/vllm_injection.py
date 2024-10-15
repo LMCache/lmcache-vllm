@@ -28,7 +28,7 @@ def new_execute_model(
     intermediate_tensors,
     num_steps: int = 1,
 ): 
-    init_lmcache_engine(self.model_config, self.parallel_config)
+    init_lmcache_engine(self.model_config, self.parallel_config, self.cache_config)
 
     # LMCache retrieval
     retrieve_status = lmcache_should_retrieve(model_input, kv_caches)
@@ -271,6 +271,24 @@ def new_log_task_completion(task: asyncio.Task,
             "Please open an issue on Github. See stack trace above for the "
             "actual cause.") from e
 
+original_prepare_model_input = None
+def wrap_prepare_model_input(
+        self,
+        seq_group_metadata_list,
+        virtual_engine: int = 0,
+        finished_requests_ids: Optional[List[str]] = None,
+    ):
+    """Wrap prepare_model_input to put seq_group_metadata_list
+    into model_input.
+    """
+    global original_prepare_model_input
+    model_input = original_prepare_model_input(
+        self, seq_group_metadata_list, virtual_engine, finished_requests_ids)
+    import dataclasses
+    # NOTE(Sixian): Use seq_group_metadata_list because
+    # sampling_metadata is only available
+    # at the last stage of pipeline parallelism stages.
+    return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
 
 def InitLMCacheEnvironment() -> None:
     """Initialize the LMCache environment.
@@ -280,8 +298,14 @@ def InitLMCacheEnvironment() -> None:
 
     import vllm.engine.async_llm_engine
     vllm.engine.async_llm_engine._log_task_completion = new_log_task_completion
+
+    import vllm.worker.model_runner
+    global original_prepare_model_input
+    original_prepare_model_input = vllm.worker.model_runner.ModelRunner.prepare_model_input
+    vllm.worker.model_runner.ModelRunner.prepare_model_input = wrap_prepare_model_input
     
     import vllm
     vllm.inputs.preprocess.InputPreprocessor._tokenize_prompt = _new_tokenize_prompt
     vllm.inputs.preprocess.InputPreprocessor._tokenize_prompt_async = _new_tokenize_prompt_async
     
+
