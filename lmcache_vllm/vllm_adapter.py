@@ -246,10 +246,6 @@ def lmcache_store_kv(
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
     assert engine is not None, "LMCache engine is not initialized."
 
-
-    with torch.cuda.stream(LMCACHE_CUDA_STREAM):
-        input_tokens_tensor = model_input.input_tokens.detach().clone().cpu()
-
     seq_lens = model_input.attn_metadata.seq_lens
         
     if hasattr(model_executable.model, "start_layer"):
