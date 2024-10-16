@@ -28,7 +28,7 @@ def new_execute_model(
     intermediate_tensors,
     num_steps: int = 1,
 ): 
-    init_lmcache_engine(self.model_config, self.parallel_config, self.cache_config)
+    init_lmcache_engine(self.model_config, self.parallel_config)
 
     # LMCache retrieval
     retrieve_status = lmcache_should_retrieve(model_input, kv_caches)
@@ -38,15 +38,16 @@ def new_execute_model(
         model_input, is_skip = lmcache_retrieve_kv(
             self.model, model_input, kv_caches, retrieve_status)
 
-        if is_skip: # create a hiddens_states
+        if is_skip:
             logger.debug("Prefill is entirely skipped")
+            
+            # Create a dummy hiddens_states
             num_tok = len(model_input.input_tokens)
             num_dim = self.model.model.embed_tokens.embedding_dim
-            if not hasattr(self, 'hidden_or_intermediate_states_fake'):
-                self.hidden_or_intermediate_states_fake = \
-                    torch.ones(num_tok, num_dim, 
-                            device=model_input.input_tokens.device,
-                            dtype=self.model.model.embed_tokens.weight.dtype)
+            hidden_or_intermediate_states = torch.ones(
+                num_tok, num_dim,
+                device=model_input.input_tokens.device,
+                dtype=self.model.model.embed_tokens.weight.dtype)
             
     
     # TODO(Jiayi): Currently, we do not handle the last chunk in chunk prefill
@@ -114,10 +115,8 @@ def new_execute_model(
         store_status = lmcache_should_store(model_input, kv_caches)
         if any([status != StoreStatus.NONE for status in store_status]):
             logger.info(f"KV cache saving mode: {store_status}")
-            lmcache_store_kv(model_executable, model_input, kv_caches,
-                            store_status)
-    else:
-        hidden_or_intermediate_states = self.hidden_or_intermediate_states_fake
+            lmcache_store_kv(model_executable, model_input, self.cache_config,
+                            kv_caches, store_status)
 
 
     # Compute the logits in the last pipeline stage.
