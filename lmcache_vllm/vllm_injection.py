@@ -3,6 +3,7 @@ This version works with vllm-0.6.1.post2
 """
 from functools import wraps
 import torch
+import os
 import asyncio
 from typing import Optional, List
 
@@ -292,6 +293,8 @@ def wrap_prepare_model_input(
 def InitLMCacheEnvironment() -> None:
     """Initialize the LMCache environment.
     """
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    
     import vllm.worker.model_runner 
     vllm.worker.model_runner.ModelRunner.execute_model = new_execute_model
 
