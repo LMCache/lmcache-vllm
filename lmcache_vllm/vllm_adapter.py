@@ -216,14 +216,14 @@ def lmcache_store_kv(
                 # Do store.
                 current_tokens = torch.tensor(seq_data.get_token_ids(), device="cpu")
                 assert len(current_tokens) == seq_len
-                skip_leading_tokens = 0 # Now do not skip.
-                if skip_leading_tokens < seq_len:
-                    assert skip_leading_tokens % engine.chunk_size == 0
-                    from vllm.attention.backends.utils import compute_slot_mapping
-                    slot_mapping = []
-                    compute_slot_mapping(False, slot_mapping, seqid, seq_len, 
-                                                                0, skip_leading_tokens, vllm_block_size, seq_group_metadata.block_tables)
-                    current_slot_mapping = slot_mapping[skip_leading_tokens:]
+                kv_tensors_mask = engine.lookup(current_tokens, True)
+                from vllm.attention.backends.utils import compute_slot_mapping
+                slot_mapping = []
+                compute_slot_mapping(False, slot_mapping, seqid, seq_len, 
+                                                            0, 0, vllm_block_size, seq_group_metadata.block_tables)
+                current_slot_mapping_tensor = torch.tensor(slot_mapping, device="cpu")
+                current_slot_mapping_tensor = current_slot_mapping_tensor[kv_tensors_mask]
+                if len(current_slot_mapping_tensor) > 0:
                     kv_tuple_list = []
                     for layer_id in range(start_layer, end_layer):
                         kv_cache = kv_caches[layer_id - start_layer]
@@ -235,12 +235,13 @@ def lmcache_store_kv(
 
 
                         kv_tuple_list.append(
-                                (key_cache[current_slot_mapping],
-                                value_cache[current_slot_mapping])
+                                (key_cache[current_slot_mapping_tensor],
+                                value_cache[current_slot_mapping_tensor])
                             )
-                    assert skip_leading_tokens == 0
-                    logger.debug(f"Store skips {skip_leading_tokens} and then stores {seq_len - skip_leading_tokens}")
-                    engine.store(current_tokens.cpu(), tuple(kv_tuple_list), 
+                    stored_token_num = len(current_slot_mapping_tensor)
+                    skipped_token_num = seq_len - stored_token_num
+                    logger.debug(f"Store skips {skipped_token_num} tokens and then stores {stored_token_num} tokens")
+                    engine.store(current_tokens.cpu(), tuple(kv_tuple_list), kv_tensors_mask,
                                 skip_existing = True, blocking = False)
 
 
