@@ -216,7 +216,7 @@ def lmcache_store_kv(
                 # Do store.
                 current_tokens = torch.tensor(seq_data.get_token_ids(), device="cpu")
                 assert len(current_tokens) == seq_len
-                kv_tensors_mask = engine.lookup(current_tokens, True)
+                kv_tensors_mask = ~engine.lookup(current_tokens, True)
                 from vllm.attention.backends.utils import compute_slot_mapping
                 slot_mapping = []
                 compute_slot_mapping(False, slot_mapping, seqid, seq_len, 
