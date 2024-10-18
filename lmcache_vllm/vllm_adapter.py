@@ -105,6 +105,8 @@ def lmcache_should_retrieve(
     :return: RetrieveStatus.
     """
 
+    seq_lens = model_input.attn_metadata.seq_lens
+    
     has_engine = LMCacheEngineBuilder.get(ENGINE_NAME) is not None
     if not has_engine or kv_caches is None:
         return RetrieveStatus.NONE
