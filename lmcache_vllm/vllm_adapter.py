@@ -258,18 +258,16 @@ def lmcache_store_kv(
     else:
         end_layer = len(kv_caches)
 
-
     seq_data_idx = 0
-
     seq_group_metadata_list = model_input.seq_group_metadata_list
-    for seq_group_idx, seq_group_metadata in enumerate(seq_group_metadata_list):
-        status = store_status[seq_group_idx]
+    for seq_group_metadata in seq_group_metadata_list:
         for seqid, seq_data in seq_group_metadata.seq_data.items():
-            
-            
-            # TODO: This is not currently used
-            skip_leading_tokens = 0
-            
+            status = store_status[seq_data_idx]
+            if status == StoreStatus.NONE:
+                continue
+            elif status == StoreStatus.DECODE:
+                if seq_len % engine.chunk_size != 0:
+                    continue
             # TODO (Jiayi): can chunk prefill and vllm prefix caching use the same logic?
             if status == StoreStatus.CHUNK_PREFILL:
                 seq_len = seq_lens[seq_data_idx]
@@ -278,37 +276,33 @@ def lmcache_store_kv(
             
             current_tokens = torch.tensor(seq_data.get_token_ids()[:seq_len], device="cpu")
             vllm_block_size = cache_config.block_size
-            
-            if status == StoreStatus.NONE:
-                continue
-            elif status == StoreStatus.DECODE:
-                if seq_len % engine.chunk_size != 0:
-                    continue
-            
+            kv_tensors_mask = ~engine.lookup(current_tokens, True)
             from vllm.attention.backends.utils import compute_slot_mapping
             slot_mapping = []
             compute_slot_mapping(False, slot_mapping, seqid, seq_len, 
-                0, skip_leading_tokens, vllm_block_size, seq_group_metadata.block_tables)
-            
-            current_slot_mapping = slot_mapping[skip_leading_tokens:]
-
-            keys, values = [], []
+                0, 0, vllm_block_size, seq_group_metadata.block_tables)
+            current_slot_mapping_tensor = torch.tensor(slot_mapping, device="cpu")
+            current_slot_mapping_tensor = current_slot_mapping_tensor[kv_tensors_mask]
             kv_tuple_list = []
-            for layer_id in range(start_layer, end_layer):
-                kv_cache = kv_caches[layer_id - start_layer]
+            if len(current_slot_mapping_tensor) > 0:
+                for layer_id in range(start_layer, end_layer):
+                    kv_cache = kv_caches[layer_id - start_layer]
 
-                _, _, num_heads, head_size = kv_cache[0].shape
+                    _, _, num_heads, head_size = kv_cache[0].shape
 
-                key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
-                value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
-                
-                kv_tuple_list.append(
-                        (key_cache[current_slot_mapping],
-                        value_cache[current_slot_mapping])
-                    )
+                    key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
+                    value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
+                    
+                    kv_tuple_list.append(
+                            (key_cache[current_slot_mapping_tensor],
+                            value_cache[current_slot_mapping_tensor])
+                        )
 
-            
-            engine.store(current_tokens.cpu(), tuple(kv_tuple_list), skip_existing = True, blocking = False)
+                stored_token_num = len(current_slot_mapping_tensor)
+                skipped_token_num = seq_len - stored_token_num
+                logger.debug(f"Store skips {skipped_token_num} tokens and then stores {stored_token_num} tokens")
+                engine.store(current_tokens.cpu(), tuple(kv_tuple_list), kv_tensors_mask,
+                            skip_existing = True, blocking = False)
             
             seq_data_idx += 1
 
@@ -557,7 +551,6 @@ def build_partial_prefill_input(
 
         # Sampling metadata related
         # seq_groups (use rebuilt query lens)
-        # TODO(Sixian): Check selected_token_indices.
         rebuilt_selected_token_indices.append(last_query_start_loc - 1)
 
     # rebuilt attn_metadata
