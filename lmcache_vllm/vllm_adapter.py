@@ -128,7 +128,8 @@ def lmcache_should_retrieve(
     :return: RetrieveStatus.
     """
 
-    # model input doesn't have seq_lens in tp
+    # model_input doesn't have seq_lens in tp
+    # but attn_metadata does
     seq_lens = model_input.attn_metadata.seq_lens
     
     has_engine = LMCacheEngineBuilder.get(ENGINE_NAME) is not None
