@@ -32,6 +32,8 @@ def new_execute_model(
 ): 
     init_lmcache_engine(self.model_config, self.parallel_config)
 
+    # TODO(Jiayi): broadcast the necessary `seq_group_metadata` in every model
+    # execution. Maybe there's a more efficient way.
     model_input = broadcast_seq_group_metadata(model_input, self.is_driver_worker)
     
     # LMCache retrieval
