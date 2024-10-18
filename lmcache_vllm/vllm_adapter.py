@@ -91,14 +91,15 @@ def broadcast_seq_group_metadata(
     model_input,
     is_driver_worker,
 ):
+    # broadcast len of `seq_group_metadata_list`
     if is_driver_worker:
         seq_group_len = [len(model_input.seq_group_metadata_list)]
     else:
         seq_group_len = [0]
-    
-    #device = torch.device("cpu")
     dist.broadcast_object_list(seq_group_len, src=0)
     seq_group_len = seq_group_len[0]
+    
+    # broadcast `seq_group_metadata_list`
     if is_driver_worker:
         seq_group_metadata_list = model_input.seq_group_metadata_list
     else:
