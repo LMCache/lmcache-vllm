@@ -40,7 +40,6 @@ def new_execute_model(
     retrieve_status = lmcache_should_retrieve(model_input, kv_caches)
     is_skip = False
     if retrieve_status != RetrieveStatus.NONE:
-        torch.distributed.barrier()
         logger.info(f"KV cache retrieving mode: {retrieve_status}")
         model_input, is_skip = lmcache_retrieve_kv(
             self.model, model_input, kv_caches, retrieve_status)
