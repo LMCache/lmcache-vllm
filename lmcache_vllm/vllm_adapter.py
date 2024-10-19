@@ -254,17 +254,16 @@ def lmcache_store_kv(
     for seq_group_metadata in seq_group_metadata_list:
         for seqid, seq_data in seq_group_metadata.seq_data.items():
             status = store_status[seq_data_idx]
-            if status == StoreStatus.NONE:
-                continue
-            elif status == StoreStatus.DECODE:
-                if seq_len % engine.chunk_size != 0:
-                    continue
             # TODO (Jiayi): can chunk prefill and vllm prefix caching use the same logic?
             if status == StoreStatus.CHUNK_PREFILL:
                 seq_len = seq_lens[seq_data_idx]
             else:
                 seq_len = seq_data.get_len()
-            
+            if status == StoreStatus.NONE:
+                continue
+            elif status == StoreStatus.DECODE:
+                if seq_len % engine.chunk_size != 0:
+                    continue
             current_tokens = torch.tensor(seq_data.get_token_ids()[:seq_len], device="cpu")
             vllm_block_size = cache_config.block_size
             kv_tensors_mask = ~engine.lookup(current_tokens, True)
@@ -363,7 +362,6 @@ def lmcache_retrieve_kv(
         for seq_id in seq_ids:
             seq_data = seq_group_metadata.seq_data[seq_id]
             is_prefill_list.append(seq_group_metadata.is_prompt)
-
             if retrieve_status == RetrieveStatus.CHUNK_PREFILL:
                 total_seq_len = seq_lens[idx]
             else:
