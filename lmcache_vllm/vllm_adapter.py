@@ -105,7 +105,6 @@ def lmcache_should_retrieve(
     :return: RetrieveStatus.
     """
 
-    seq_lens = model_input.attn_metadata.seq_lens
     
     has_engine = LMCacheEngineBuilder.get(ENGINE_NAME) is not None
     if not has_engine or kv_caches is None:
@@ -363,7 +362,7 @@ def lmcache_retrieve_kv(
         seq_ids = model_input.request_ids_to_seq_ids[request_id]
         for seq_id in seq_ids:
             seq_data = seq_group_metadata.seq_data[seq_id]
-            
+            is_prefill_list.append(seq_group_metadata.is_prompt)
 
             if retrieve_status == RetrieveStatus.CHUNK_PREFILL:
                 total_seq_len = seq_lens[idx]
@@ -442,9 +441,6 @@ def lmcache_retrieve_kv(
             
             idx += 1
             
-            # TODO(Jiayi): `is_prefill` seems redundant
-            # please try to remove this in the future 
-            is_prefill_list.append(True)
     
     seq_cnt = len(query_start_loc) - 1
     assert idx == seq_cnt
