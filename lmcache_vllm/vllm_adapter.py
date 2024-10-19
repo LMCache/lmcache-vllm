@@ -105,7 +105,6 @@ def lmcache_should_retrieve(
     :return: RetrieveStatus.
     """
 
-    seq_lens = model_input.attn_metadata.seq_lens
     
     has_engine = LMCacheEngineBuilder.get(ENGINE_NAME) is not None
     if not has_engine or kv_caches is None:
@@ -199,14 +198,6 @@ def lmcache_should_store(
             # There should only be 1 chunk in chunked prefill
             assert len(seq_lens) == 1
             return [StoreStatus.CHUNK_PREFILL]
-        key = list(model_input.sampling_metadata.seq_groups[0].seq_data.keys())[0]
-        seq_data = model_input.sampling_metadata.seq_groups[0].seq_data[key]
-        prompt_tokens = seq_data.prompt_token_ids
-        
-        if len(prompt_tokens)-1 != selected_token_indices[0]:
-            # last chunk in chunk prefill
-            assert len(seq_lens) == 1
-            return [StoreStatus.NONE]
         return [StoreStatus.PREFILL] * len(seq_lens)
         
 
@@ -258,57 +249,50 @@ def lmcache_store_kv(
     else:
         end_layer = len(kv_caches)
 
-
     seq_data_idx = 0
-
     seq_group_metadata_list = model_input.seq_group_metadata_list
-    for seq_group_idx, seq_group_metadata in enumerate(seq_group_metadata_list):
-        status = store_status[seq_group_idx]
+    for seq_group_metadata in seq_group_metadata_list:
         for seqid, seq_data in seq_group_metadata.seq_data.items():
-            
-            
-            # TODO: This is not currently used
-            skip_leading_tokens = 0
-            
+            status = store_status[seq_data_idx]
             # TODO (Jiayi): can chunk prefill and vllm prefix caching use the same logic?
             if status == StoreStatus.CHUNK_PREFILL:
                 seq_len = seq_lens[seq_data_idx]
             else:
                 seq_len = seq_data.get_len()
-            
-            current_tokens = torch.tensor(seq_data.get_token_ids()[:seq_len], device="cpu")
-            vllm_block_size = cache_config.block_size
-            
             if status == StoreStatus.NONE:
                 continue
             elif status == StoreStatus.DECODE:
                 if seq_len % engine.chunk_size != 0:
                     continue
-            
+            current_tokens = torch.tensor(seq_data.get_token_ids()[:seq_len], device="cpu")
+            vllm_block_size = cache_config.block_size
+            kv_tensors_mask = ~engine.lookup(current_tokens, True)
             from vllm.attention.backends.utils import compute_slot_mapping
             slot_mapping = []
             compute_slot_mapping(False, slot_mapping, seqid, seq_len, 
-                0, skip_leading_tokens, vllm_block_size, seq_group_metadata.block_tables)
-            
-            current_slot_mapping = slot_mapping[skip_leading_tokens:]
-
-            keys, values = [], []
+                0, 0, vllm_block_size, seq_group_metadata.block_tables)
+            current_slot_mapping_tensor = torch.tensor(slot_mapping, device="cpu")
+            current_slot_mapping_tensor = current_slot_mapping_tensor[kv_tensors_mask]
             kv_tuple_list = []
-            for layer_id in range(start_layer, end_layer):
-                kv_cache = kv_caches[layer_id - start_layer]
+            if len(current_slot_mapping_tensor) > 0:
+                for layer_id in range(start_layer, end_layer):
+                    kv_cache = kv_caches[layer_id - start_layer]
 
-                _, _, num_heads, head_size = kv_cache[0].shape
+                    _, _, num_heads, head_size = kv_cache[0].shape
 
-                key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
-                value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
-                
-                kv_tuple_list.append(
-                        (key_cache[current_slot_mapping],
-                        value_cache[current_slot_mapping])
-                    )
+                    key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
+                    value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
+                    
+                    kv_tuple_list.append(
+                            (key_cache[current_slot_mapping_tensor],
+                            value_cache[current_slot_mapping_tensor])
+                        )
 
-            
-            engine.store(current_tokens.cpu(), tuple(kv_tuple_list), skip_existing = True, blocking = False)
+                stored_token_num = len(current_slot_mapping_tensor)
+                skipped_token_num = seq_len - stored_token_num
+                logger.debug(f"Store skips {skipped_token_num} tokens and then stores {stored_token_num} tokens")
+                engine.store(current_tokens.cpu(), tuple(kv_tuple_list), kv_tensors_mask,
+                            skip_existing = True, blocking = False)
             
             seq_data_idx += 1
 
@@ -377,8 +361,7 @@ def lmcache_retrieve_kv(
         seq_ids = model_input.request_ids_to_seq_ids[request_id]
         for seq_id in seq_ids:
             seq_data = seq_group_metadata.seq_data[seq_id]
-            
-
+            is_prefill_list.append(seq_group_metadata.is_prompt)
             if retrieve_status == RetrieveStatus.CHUNK_PREFILL:
                 total_seq_len = seq_lens[idx]
             else:
@@ -396,7 +379,7 @@ def lmcache_retrieve_kv(
             # TODO(Jiayi): is deepcopy avoidable here?
             temp_block_table = deepcopy(seq_group_metadata.block_tables[seq_id])
             temp_block_table_list.append(temp_block_table)
-                
+
             # number of tokens computed by vllm (e.g., chunk prefill, prefix caching)
             vllm_num_computed_tokens = total_seq_len - vllm_num_required_tokens
             
@@ -422,6 +405,7 @@ def lmcache_retrieve_kv(
                 # Avoid the error when prefix is exactly the same as the retrieved
                 # However, in chunk prefill, the entire prefill should be skipped
                 if num_computed_tokens == total_seq_len:
+                    lmc_num_computed_tokens -= 1
                     num_computed_tokens -= 1
             
             num_computed_tokens_list.append(num_computed_tokens)
@@ -455,9 +439,6 @@ def lmcache_retrieve_kv(
             
             idx += 1
             
-            # TODO(Jiayi): `is_prefill` seems redundant
-            # please try to remove this in the future 
-            is_prefill_list.append(True)
     
     seq_cnt = len(query_start_loc) - 1
     assert idx == seq_cnt
@@ -466,7 +447,7 @@ def lmcache_retrieve_kv(
     
     if retrieve_status == RetrieveStatus.CHUNK_PREFILL and \
         num_request_not_found == 0:
-        return model_input, True  
+        return model_input, True
             
     # Some of the request can be skipped for a bit
     # TODO(Jiayi): need e2e test full prefill and partial prefill
@@ -557,7 +538,6 @@ def build_partial_prefill_input(
 
         # Sampling metadata related
         # seq_groups (use rebuilt query lens)
-        # TODO(Sixian): Check selected_token_indices.
         rebuilt_selected_token_indices.append(last_query_start_loc - 1)
 
     # rebuilt attn_metadata
