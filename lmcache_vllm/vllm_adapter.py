@@ -1,4 +1,5 @@
 from typing import TYPE_CHECKING, List, Optional, Tuple
+from types import SimpleNamespace
 from enum import Enum
 import os
 import torch
@@ -37,6 +38,12 @@ class RetrieveStatus(Enum):
     CHUNK_PREFILL_LAST = 3
     NONE = 4
 
+SUPPORTED_MODELS = SimpleNamespace(
+    llama_family = ["meta-llama/Llama-3.1-8B-Instruct"],
+    mistral_family = ["mistralai/Mistral-7B-Instruct-v0.2"],
+    glm_family = ["THUDM/glm-4-9b-chat"],
+    qwen_family = ["Qwen/Qwen-7B"],
+)
 
 def init_lmcache_engine(
         model_config: ModelConfig,
@@ -273,12 +280,18 @@ def lmcache_store_kv(
 
     seq_lens = model_input.attn_metadata.seq_lens
         
-    if hasattr(model_executable.model, "start_layer"):
+    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
+    # How does PP work in this case?
+    if hasattr(model_executable, "model") and \
+        hasattr(model_executable.model, "start_layer"):
         start_layer = model_executable.model.start_layer
     else:
         start_layer = 0
 
-    if hasattr(model_executable.model, "end_layer"):
+    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
+    # How does PP work in this case?
+    if hasattr(model_executable, "model") and \
+        hasattr(model_executable.model, "start_layer"):
         end_layer = model_executable.model.end_layer
     else:
         end_layer = len(kv_caches)
@@ -301,6 +314,8 @@ def lmcache_store_kv(
                 seq_len = seq_lens[seq_data_idx]
             else:
                 seq_len = seq_data.get_len()
+            
+            print(f"Store: {seq_data.get_token_ids()[:seq_len]}")
             
             current_tokens = torch.tensor(seq_data.get_token_ids()[:seq_len], device="cpu")
             vllm_block_size = cache_config.block_size
@@ -341,6 +356,7 @@ def lmcache_store_kv(
 @_lmcache_nvtx_annotate
 def lmcache_retrieve_kv(
     model_executable,
+    model_name: str,
     model_input: "ModelInputForGPUWithSamplingMetadata",
     kv_caches: List[torch.Tensor],
     retrieve_status: RetrieveStatus,
@@ -373,13 +389,31 @@ def lmcache_retrieve_kv(
     slot_mapping = model_input.attn_metadata.slot_mapping.flatten()
     seq_lens = model_input.attn_metadata.seq_lens
 
-    if hasattr(model_executable.model, "start_layer"):
-        start_layer = model_executable.model.start_layer
+    
+    if model_name in SUPPORTED_MODELS.llama_family or \
+        model_name in SUPPORTED_MODELS.mistral_family:
+        model = model_executable.model
+        model_layers = model.layers
+        attn_layers = [layer.self_attn for layer in model_layers]
+    elif model_name in SUPPORTED_MODELS.glm_family:
+        model = model_executable.transformer
+        model_layers = model.encoder.layers
+        attn_layers = [layer.self_attention for layer in model_layers]
+    else:
+        # `else` is the default setting, which could be wrong
+        model = model_executable.model
+        model_layers = model.layers
+        attn_layers = [layer.self_attn for layer in model_layers]
+    
+    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
+    # How does PP work in this case?
+    if hasattr(model, "start_layer"):
+        start_layer = model.start_layer
     else:
         start_layer = 0
 
-    if hasattr(model_executable.model, "end_layer"):
-        end_layer = model_executable.model.end_layer
+    if hasattr(model, "end_layer"):
+        end_layer = model.end_layer
     else:
         end_layer = len(kv_caches)
     
@@ -411,6 +445,9 @@ def lmcache_retrieve_kv(
                 total_seq_len = seq_lens[idx]
             else:
                 total_seq_len = seq_data.get_len()
+            
+            print(f"Retrieve: {seq_data.get_token_ids()[:total_seq_len]}")
+            
             full_token_tensor = torch.tensor(seq_data.get_token_ids()[:total_seq_len], device="cpu")
             full_tokens_list.append(full_token_tensor)
             
@@ -468,7 +505,10 @@ def lmcache_retrieve_kv(
             for i in range(start_layer, end_layer):
                 layer_idx = i - start_layer
                 kv_cache = kv_caches[layer_idx]
-                layer = model_executable.model.layers[i]
+                
+                model_layer = model_layers[i]
+                attn_layer = attn_layers[i]
+                
                 key_cache, value_cache = kv_cache[0], kv_cache[1]
                 ops.reshape_and_cache_flash(
                     kv_tuple[layer_idx][0].to(key_cache.device),
@@ -476,9 +516,9 @@ def lmcache_retrieve_kv(
                     key_cache,
                     value_cache,
                     slot_mapping[start_pos:start_pos + lmc_num_computed_tokens],
-                    layer.self_attn.attn.kv_cache_dtype,
-                    layer.self_attn.attn._k_scale,
-                    layer.self_attn.attn._v_scale,
+                    attn_layer.attn.kv_cache_dtype,
+                    attn_layer.attn._k_scale,
+                    attn_layer.attn._v_scale,
                 )
             
             idx += 1
