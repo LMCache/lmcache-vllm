@@ -199,14 +199,6 @@ def lmcache_should_store(
             # There should only be 1 chunk in chunked prefill
             assert len(seq_lens) == 1
             return [StoreStatus.CHUNK_PREFILL]
-        key = list(model_input.sampling_metadata.seq_groups[0].seq_data.keys())[0]
-        seq_data = model_input.sampling_metadata.seq_groups[0].seq_data[key]
-        prompt_tokens = seq_data.prompt_token_ids
-        
-        if len(prompt_tokens)-1 != selected_token_indices[0]:
-            # last chunk in chunk prefill
-            assert len(seq_lens) == 1
-            return [StoreStatus.NONE]
         return [StoreStatus.PREFILL] * len(seq_lens)
         
 
@@ -390,7 +382,7 @@ def lmcache_retrieve_kv(
             # TODO(Jiayi): is deepcopy avoidable here?
             temp_block_table = deepcopy(seq_group_metadata.block_tables[seq_id])
             temp_block_table_list.append(temp_block_table)
-                
+
             # number of tokens computed by vllm (e.g., chunk prefill, prefix caching)
             vllm_num_computed_tokens = total_seq_len - vllm_num_required_tokens
             
@@ -416,6 +408,7 @@ def lmcache_retrieve_kv(
                 # Avoid the error when prefix is exactly the same as the retrieved
                 # However, in chunk prefill, the entire prefill should be skipped
                 if num_computed_tokens == total_seq_len:
+                    lmc_num_computed_tokens -= 1
                     num_computed_tokens -= 1
             
             num_computed_tokens_list.append(num_computed_tokens)
@@ -460,7 +453,7 @@ def lmcache_retrieve_kv(
     
     if retrieve_status == RetrieveStatus.CHUNK_PREFILL and \
         num_request_not_found == 0:
-        return model_input, True  
+        return model_input, True
             
     # Some of the request can be skipped for a bit
     # TODO(Jiayi): need e2e test full prefill and partial prefill
