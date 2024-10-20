@@ -316,8 +316,6 @@ def lmcache_store_kv(
             else:
                 seq_len = seq_data.get_len()
             
-            print(f"Store: {seq_data.get_token_ids()[:seq_len]}")
-            
             current_tokens = torch.tensor(seq_data.get_token_ids()[:seq_len], device="cpu")
             vllm_block_size = cache_config.block_size
             
@@ -401,7 +399,7 @@ def lmcache_retrieve_kv(
         model_layers = model.encoder.layers
         attn_layers = [layer.self_attention for layer in model_layers]
     else:
-        # `else` is the default setting, which could be wrong
+        # FIXME(Jiayi): `else` is the default setting, which could be wrong
         model = model_executable.model
         model_layers = model.layers
         attn_layers = [layer.self_attn for layer in model_layers]
@@ -446,8 +444,6 @@ def lmcache_retrieve_kv(
                 total_seq_len = seq_lens[idx]
             else:
                 total_seq_len = seq_data.get_len()
-            
-            print(f"Retrieve: {seq_data.get_token_ids()[:total_seq_len]}")
             
             full_token_tensor = torch.tensor(seq_data.get_token_ids()[:total_seq_len], device="cpu")
             full_tokens_list.append(full_token_tensor)
