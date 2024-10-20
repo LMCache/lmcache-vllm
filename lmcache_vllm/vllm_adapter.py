@@ -30,7 +30,8 @@ class StoreStatus(Enum):
     PREFILL = 1
     CHUNK_PREFILL = 2
     DECODE = 3
-    NONE = 4
+    SUFFIX_PREFILL = 4
+    NONE = 5
 
 class RetrieveStatus(Enum):
     PREFILL = 1
@@ -235,14 +236,17 @@ def lmcache_should_store(
             return [StoreStatus.CHUNK_PREFILL]
         
         seq_group_metadata_list = model_input.seq_group_metadata_list
+        idx = 0
         for seq_group_idx, seq_group_metadata in enumerate(seq_group_metadata_list):
             for seqid, seq_data in seq_group_metadata.seq_data.items():
                 if seq_data.get_len()-1 != selected_token_indices[0]:
                     # last chunk in chunk prefill
-                    assert len(seq_lens) == 1
-                    return [StoreStatus.NONE]
-        
-        return [StoreStatus.PREFILL] * len(seq_lens)
+                    # or prefix already hit in retrieve
+                    store_status[idx] = StoreStatus.SUFFIX_PREFILL
+                else:
+                    store_status[idx] = StoreStatus.PREFILL
+                idx += 1
+        return store_status
         
 
     # Determine whether to save decoded KV cache
@@ -311,7 +315,7 @@ def lmcache_store_kv(
             skip_leading_tokens = 0
             
             # TODO (Jiayi): can chunk prefill and vllm prefix caching use the same logic?
-            if status == StoreStatus.CHUNK_PREFILL:
+            if status in [StoreStatus.CHUNK_PREFILL, StoreStatus.SUFFIX_PREFILL]:
                 seq_len = seq_lens[seq_data_idx]
             else:
                 seq_len = seq_data.get_len()
