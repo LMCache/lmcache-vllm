@@ -1,9 +1,12 @@
 from typing import TYPE_CHECKING, List, Optional, Tuple
+from types import SimpleNamespace
 from enum import Enum
 import os
 import torch
+import dataclasses
 from copy import deepcopy
 from torch.nn.utils.rnn import pad_sequence
+import torch.distributed as dist
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
@@ -35,6 +38,13 @@ class RetrieveStatus(Enum):
     CHUNK_PREFILL_LAST = 3
     NONE = 4
 
+SUPPORTED_MODELS = SimpleNamespace(
+    llama_family = ["meta-llama/Llama-3.1-8B-Instruct"],
+    longchat_family = ["lmsys/longchat-7b-16k"],
+    mistral_family = ["mistralai/Mistral-7B-Instruct-v0.2"],
+    glm_family = ["THUDM/glm-4-9b-chat"],
+    qwen_family = ["Qwen/Qwen-7B"],
+)
 
 def init_lmcache_engine(
         model_config: ModelConfig,
@@ -85,6 +95,27 @@ def init_lmcache_engine(
 
     return engine
 
+def broadcast_seq_group_metadata(
+    model_input,
+    is_driver_worker,
+):
+    # broadcast len of `seq_group_metadata_list`
+    if is_driver_worker:
+        seq_group_len = [len(model_input.seq_group_metadata_list)]
+    else:
+        seq_group_len = [0]
+    dist.broadcast_object_list(seq_group_len, src=0)
+    seq_group_len = seq_group_len[0]
+    
+    # broadcast `seq_group_metadata_list`
+    if is_driver_worker:
+        seq_group_metadata_list = model_input.seq_group_metadata_list
+    else:
+        seq_group_metadata_list = [None] * seq_group_len
+    dist.broadcast_object_list(seq_group_metadata_list , src=0)
+    
+    return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
+
 def close_lmcache_engine() -> None:
     """Close the LMCache engine if it is initialized.
     """
@@ -105,6 +136,8 @@ def lmcache_should_retrieve(
     :return: RetrieveStatus.
     """
 
+    # model_input doesn't have seq_lens in tp
+    # but attn_metadata does
     seq_lens = model_input.attn_metadata.seq_lens
     
     has_engine = LMCacheEngineBuilder.get(ENGINE_NAME) is not None
@@ -124,14 +157,15 @@ def lmcache_should_retrieve(
     # is not and should not be supported here
     # what about multuple chunk prefills in a single batch??
     
+    
     # Assume all chunks are prefills
-    is_all_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
+    is_all_prefill_run = ((attn_meta.num_prefills == len(seq_lens))\
         and prefill_meta is not None)
     if is_all_prefill_run:
         selected_token_indices = model_input.sampling_metadata.selected_token_indices
         if len(selected_token_indices) == 0:
             # There should only be 1 chunk in chunked prefill
-            assert len(model_input.seq_lens) == 1
+            assert len(seq_lens) == 1
             return RetrieveStatus.CHUNK_PREFILL
         
         '''
@@ -162,7 +196,7 @@ def lmcache_should_store(
     :type kv_caches: List[torch.Tensor]
 
     :return: A list of StoreStatus.
-             StoreStatus.PREFILL/DECODE if we should store KV after PREFILL/DECODE.
+             StoreStatus.PREFILL/DECODE/CHUNK_PREFILL if we should store KV after PREFILL/DECODE.
              StoreStatus.NONE if no storing is required.
     """
     seq_lens = model_input.attn_metadata.seq_lens
@@ -190,7 +224,7 @@ def lmcache_should_store(
 
     # FIXME(Jiayi): need to support chunked prefill (batch prefill and decode)
     # check if the current run is prefill
-    is_all_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
+    is_all_prefill_run = ((attn_meta.num_prefills == len(seq_lens))\
         and (prefill_meta is not None))
 
     if is_all_prefill_run:
@@ -199,22 +233,21 @@ def lmcache_should_store(
             # There should only be 1 chunk in chunked prefill
             assert len(seq_lens) == 1
             return [StoreStatus.CHUNK_PREFILL]
-        key = list(model_input.sampling_metadata.seq_groups[0].seq_data.keys())[0]
-        seq_data = model_input.sampling_metadata.seq_groups[0].seq_data[key]
-        prompt_tokens = seq_data.prompt_token_ids
         
-        if len(prompt_tokens)-1 != selected_token_indices[0]:
-            # last chunk in chunk prefill
-            assert len(seq_lens) == 1
-            return [StoreStatus.NONE]
+        seq_group_metadata_list = model_input.seq_group_metadata_list
+        for seq_group_idx, seq_group_metadata in enumerate(seq_group_metadata_list):
+            for seqid, seq_data in seq_group_metadata.seq_data.items():
+                if seq_data.get_len()-1 != selected_token_indices[0]:
+                    # last chunk in chunk prefill
+                    assert len(seq_lens) == 1
+                    return [StoreStatus.NONE]
+        
         return [StoreStatus.PREFILL] * len(seq_lens)
         
 
     # Determine whether to save decoded KV cache
     #seq_groups = model_input.sampling_metadata.seq_groups
     if engine.save_decode_cache:
-        seq_lens = model_input.attn_metadata.seq_lens
-
         for idx, seq_len in enumerate(seq_lens):
             if seq_len % engine.chunk_size == 0:
                 store_status[idx] = StoreStatus.DECODE
@@ -248,20 +281,27 @@ def lmcache_store_kv(
 
     seq_lens = model_input.attn_metadata.seq_lens
         
-    if hasattr(model_executable.model, "start_layer"):
+    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
+    # How does PP work in this case?
+    if hasattr(model_executable, "model") and \
+        hasattr(model_executable.model, "start_layer"):
         start_layer = model_executable.model.start_layer
     else:
         start_layer = 0
 
-    if hasattr(model_executable.model, "end_layer"):
+    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
+    # How does PP work in this case?
+    if hasattr(model_executable, "model") and \
+        hasattr(model_executable.model, "start_layer"):
         end_layer = model_executable.model.end_layer
     else:
         end_layer = len(kv_caches)
 
 
     seq_data_idx = 0
-
+    
     seq_group_metadata_list = model_input.seq_group_metadata_list
+    
     for seq_group_idx, seq_group_metadata in enumerate(seq_group_metadata_list):
         status = store_status[seq_group_idx]
         for seqid, seq_data in seq_group_metadata.seq_data.items():
@@ -315,6 +355,7 @@ def lmcache_store_kv(
 @_lmcache_nvtx_annotate
 def lmcache_retrieve_kv(
     model_executable,
+    model_name: str,
     model_input: "ModelInputForGPUWithSamplingMetadata",
     kv_caches: List[torch.Tensor],
     retrieve_status: RetrieveStatus,
@@ -347,13 +388,31 @@ def lmcache_retrieve_kv(
     slot_mapping = model_input.attn_metadata.slot_mapping.flatten()
     seq_lens = model_input.attn_metadata.seq_lens
 
-    if hasattr(model_executable.model, "start_layer"):
-        start_layer = model_executable.model.start_layer
+    
+    if model_name in SUPPORTED_MODELS.llama_family or \
+        model_name in SUPPORTED_MODELS.mistral_family:
+        model = model_executable.model
+        model_layers = model.layers
+        attn_layers = [layer.self_attn for layer in model_layers]
+    elif model_name in SUPPORTED_MODELS.glm_family:
+        model = model_executable.transformer
+        model_layers = model.encoder.layers
+        attn_layers = [layer.self_attention for layer in model_layers]
+    else:
+        # FIXME(Jiayi): `else` is the default setting, which could be wrong
+        model = model_executable.model
+        model_layers = model.layers
+        attn_layers = [layer.self_attn for layer in model_layers]
+    
+    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
+    # How does PP work in this case?
+    if hasattr(model, "start_layer"):
+        start_layer = model.start_layer
     else:
         start_layer = 0
 
-    if hasattr(model_executable.model, "end_layer"):
-        end_layer = model_executable.model.end_layer
+    if hasattr(model, "end_layer"):
+        end_layer = model.end_layer
     else:
         end_layer = len(kv_caches)
     
@@ -364,13 +423,15 @@ def lmcache_retrieve_kv(
     
     start_pos_list = []
     is_prefill_list = []
-    seq_group_metadata_list = model_input.seq_group_metadata_list
+     
     next_start_pos = 0
     num_request_not_found = 0
     temp_block_table_list = []
     
     # idx is on a sequence, not a sequence group.
     idx = 0
+
+    seq_group_metadata_list = model_input.seq_group_metadata_list
 
     for seq_group_metadata in seq_group_metadata_list:
         request_id = seq_group_metadata.request_id
@@ -383,6 +444,7 @@ def lmcache_retrieve_kv(
                 total_seq_len = seq_lens[idx]
             else:
                 total_seq_len = seq_data.get_len()
+            
             full_token_tensor = torch.tensor(seq_data.get_token_ids()[:total_seq_len], device="cpu")
             full_tokens_list.append(full_token_tensor)
             
@@ -440,7 +502,10 @@ def lmcache_retrieve_kv(
             for i in range(start_layer, end_layer):
                 layer_idx = i - start_layer
                 kv_cache = kv_caches[layer_idx]
-                layer = model_executable.model.layers[i]
+                
+                model_layer = model_layers[i]
+                attn_layer = attn_layers[i]
+                
                 key_cache, value_cache = kv_cache[0], kv_cache[1]
                 ops.reshape_and_cache_flash(
                     kv_tuple[layer_idx][0].to(key_cache.device),
@@ -448,9 +513,9 @@ def lmcache_retrieve_kv(
                     key_cache,
                     value_cache,
                     slot_mapping[start_pos:start_pos + lmc_num_computed_tokens],
-                    layer.self_attn.attn.kv_cache_dtype,
-                    layer.self_attn.attn._k_scale,
-                    layer.self_attn.attn._v_scale,
+                    attn_layer.attn.kv_cache_dtype,
+                    attn_layer.attn._k_scale,
+                    attn_layer.attn._v_scale,
                 )
             
             idx += 1
