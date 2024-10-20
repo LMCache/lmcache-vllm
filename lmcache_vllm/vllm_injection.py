@@ -206,6 +206,8 @@ def _patch_padding_space(
     """
     if tokenizer_id in SUPPORTED_MODELS.mistral_family:
         prompt = prompt.replace("[/INST]  ", "[/INST] ")
+    elif tokenizer_id in SUPPORTED_MODELS.llama_family:
+        prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n"
     elif tokenizer_id in SUPPORTED_MODELS.glm_family:
         prompt += "<|assistant|>\n"
     return prompt

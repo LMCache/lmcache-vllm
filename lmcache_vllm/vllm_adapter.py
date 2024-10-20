@@ -40,6 +40,7 @@ class RetrieveStatus(Enum):
 
 SUPPORTED_MODELS = SimpleNamespace(
     llama_family = ["meta-llama/Llama-3.1-8B-Instruct"],
+    longchat_family = ["lmsys/longchat-7b-16k"],
     mistral_family = ["mistralai/Mistral-7B-Instruct-v0.2"],
     glm_family = ["THUDM/glm-4-9b-chat"],
     qwen_family = ["Qwen/Qwen-7B"],
