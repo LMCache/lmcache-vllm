@@ -14,7 +14,7 @@ from vllm.distributed import get_pp_group
 from lmcache_vllm.vllm_adapter import (
         init_lmcache_engine, lmcache_should_store, lmcache_should_retrieve,
         lmcache_store_kv, lmcache_retrieve_kv, close_lmcache_engine,
-        StoreStatus)
+        StoreStatus, RetrieveStatus)
 
 from lmcache.logging import init_logger
 logger = init_logger(__name__)
@@ -31,9 +31,27 @@ def new_execute_model(
     init_lmcache_engine(self.model_config, self.parallel_config, self.cache_config)
 
     # LMCache retrieval
-    if lmcache_should_retrieve(model_input, kv_caches):
-        model_input = lmcache_retrieve_kv(self.model, model_input, kv_caches)
+    retrieve_status = lmcache_should_retrieve(model_input, kv_caches)
+    is_skip = False
+    if retrieve_status != RetrieveStatus.NONE:
+        logger.info(f"KV cache retrieving mode: {retrieve_status}")
+        model_input, is_skip = lmcache_retrieve_kv(
+            self.model, model_input, kv_caches, retrieve_status)
 
+        if is_skip:
+            logger.debug("Prefill is entirely skipped")
+            
+            # Create a dummy hiddens_states
+            num_tok = len(model_input.input_tokens)
+            num_dim = self.model.model.embed_tokens.embedding_dim
+            hidden_or_intermediate_states = torch.ones(
+                num_tok, num_dim,
+                device=model_input.input_tokens.device,
+                dtype=self.model.model.embed_tokens.weight.dtype)
+            
+    
+    # TODO(Jiayi): Currently, we do not handle the last chunk in chunk prefill
+    
     if num_steps > 1:
         raise ValueError("num_steps > 1 is not supported in ModelRunner")
  
@@ -77,30 +95,29 @@ def new_execute_model(
         model_forward_start = torch.cuda.Event(enable_timing=True)
         model_forward_end = torch.cuda.Event(enable_timing=True)
         model_forward_start.record()
- 
 
-    hidden_or_intermediate_states = model_executable(
-        input_ids=model_input.input_tokens,
-        positions=model_input.input_positions,
-        kv_caches=kv_caches,
-        attn_metadata=model_input.attn_metadata,
-        intermediate_tensors=intermediate_tensors,
-        **MultiModalInputs.as_kwargs(multi_modal_kwargs,
-                                     device=self.device),
-        **seqlen_agnostic_kwargs)
- 
-    if (self.observability_config is not None
-            and self.observability_config.collect_model_forward_time):
-        model_forward_end.record()
+    if not is_skip:
+        hidden_or_intermediate_states = model_executable(
+            input_ids=model_input.input_tokens,
+            positions=model_input.input_positions,
+            kv_caches=kv_caches,
+            attn_metadata=model_input.attn_metadata,
+            intermediate_tensors=intermediate_tensors,
+            **MultiModalInputs.as_kwargs(multi_modal_kwargs,
+                                        device=self.device),
+            **seqlen_agnostic_kwargs)
 
-    # LMCache storing
-    should_store = lmcache_should_store(model_input, kv_caches)
-    if should_store != StoreStatus.NONE:
-        assert should_store in [StoreStatus.PREFILL, StoreStatus.DECODE]
-        logger.info(f"KV cache saving mode: {should_store}")
-        is_prefill = (should_store == StoreStatus.PREFILL)
-        lmcache_store_kv(model_executable, model_input, kv_caches,
-                         is_prefill)
+        if (self.observability_config is not None
+                and self.observability_config.collect_model_forward_time):
+            model_forward_end.record()
+
+        # LMCache storing
+        store_status = lmcache_should_store(model_input, kv_caches)
+        if any([status != StoreStatus.NONE for status in store_status]):
+            logger.info(f"KV cache saving mode: {store_status}")
+            lmcache_store_kv(model_executable, model_input, self.cache_config,
+                            kv_caches, store_status)
+
 
     # Compute the logits in the last pipeline stage.
     if not get_pp_group().is_last_rank:
@@ -253,18 +270,41 @@ def new_log_task_completion(task: asyncio.Task,
             "Please open an issue on Github. See stack trace above for the "
             "actual cause.") from e
 
+original_prepare_model_input = None
+def wrap_prepare_model_input(
+        self,
+        seq_group_metadata_list,
+        virtual_engine: int = 0,
+        finished_requests_ids: Optional[List[str]] = None,
+    ):
+    """Wrap prepare_model_input to put seq_group_metadata_list
+    into model_input.
+    """
+    global original_prepare_model_input
+    model_input = original_prepare_model_input(
+        self, seq_group_metadata_list, virtual_engine, finished_requests_ids)
+    import dataclasses
+    # NOTE(Sixian): Use seq_group_metadata_list because
+    # sampling_metadata is only available
+    # at the last stage of pipeline parallelism stages.
+    return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
 
 def InitLMCacheEnvironment() -> None:
     """Initialize the LMCache environment.
     """
-    
     import vllm.worker.model_runner 
     vllm.worker.model_runner.ModelRunner.execute_model = new_execute_model
 
     import vllm.engine.async_llm_engine
     vllm.engine.async_llm_engine._log_task_completion = new_log_task_completion
+
+    import vllm.worker.model_runner
+    global original_prepare_model_input
+    original_prepare_model_input = vllm.worker.model_runner.ModelRunner.prepare_model_input
+    vllm.worker.model_runner.ModelRunner.prepare_model_input = wrap_prepare_model_input
     
     import vllm
     vllm.inputs.preprocess.InputPreprocessor._tokenize_prompt = _new_tokenize_prompt
     vllm.inputs.preprocess.InputPreprocessor._tokenize_prompt_async = _new_tokenize_prompt_async
     
+
