@@ -6,6 +6,8 @@ import torch
 import dataclasses
 from copy import deepcopy
 from torch.nn.utils.rnn import pad_sequence
+from dataclasses import dataclass
+from torch import nn
 import torch.distributed as dist
 
 if TYPE_CHECKING:
@@ -60,6 +62,54 @@ SUPPORTED_MODELS = SimpleNamespace(
     glm_family = ["THUDM/glm-4-9b-chat"],
     qwen_family = ["Qwen/Qwen-7B"],
 )
+
+@dataclass
+class ModelInputSubset:
+    model_layers: List[nn.Module]
+    attn_layers: List[nn.Module]
+    start_layer: int
+    end_layer: int
+    
+
+def create_model_input_subset(
+    model_name: str,
+    model_executable: "ModelInputForGPUWithSamplingMetadata",
+) -> ModelInputSubset:
+    if model_name in SUPPORTED_MODELS.llama_family or \
+        model_name in SUPPORTED_MODELS.mistral_family:
+        model = model_executable.model
+        model_layers = model.layers
+        attn_layers = [layer.self_attn for layer in model_layers]
+    elif model_name in SUPPORTED_MODELS.glm_family:
+        model = model_executable.transformer
+        model_layers = model.encoder.layers
+        attn_layers = [layer.self_attention for layer in model_layers]
+    else:
+        # FIXME(Jiayi): `else` is the default setting, which could be wrong
+        model = model_executable.model
+        model_layers = model.layers
+        attn_layers = [layer.self_attn for layer in model_layers]
+    
+    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
+    # How does PP work in this case?
+    if hasattr(model, "start_layer"):
+        start_layer = model.start_layer
+    else:
+        start_layer = 0
+
+    if hasattr(model, "end_layer"):
+        end_layer = model.end_layer
+    else:
+        end_layer = len(model_layers)
+    
+    model_input_subset = ModelInputSubset(
+        model_layers=model_layers,
+        attn_layers=attn_layers,
+        start_layer=start_layer,
+        end_layer=end_layer
+    )
+    
+    return model_input_subset
 
 def init_lmcache_engine(
         model_config: ModelConfig,
@@ -423,40 +473,16 @@ def lmcache_retrieve_kv(
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
     assert engine is not None, "LMCache engine is not initialized."
 
-    
-    # This is disagg decode instance, during prefill state
-    # Need to receive KV from the prefill instance
     query_start_loc = model_input.attn_metadata.query_start_loc
     slot_mapping = model_input.attn_metadata.slot_mapping.flatten()
     seq_lens = model_input.attn_metadata.seq_lens
 
-    
-    if model_name in SUPPORTED_MODELS.llama_family or \
-        model_name in SUPPORTED_MODELS.mistral_family:
-        model = model_executable.model
-        model_layers = model.layers
-        attn_layers = [layer.self_attn for layer in model_layers]
-    elif model_name in SUPPORTED_MODELS.glm_family:
-        model = model_executable.transformer
-        model_layers = model.encoder.layers
-        attn_layers = [layer.self_attention for layer in model_layers]
-    else:
-        # FIXME(Jiayi): `else` is the default setting, which could be wrong
-        model = model_executable.model
-        model_layers = model.layers
-        attn_layers = [layer.self_attn for layer in model_layers]
-    
-    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
-    # How does PP work in this case?
-    if hasattr(model, "start_layer"):
-        start_layer = model.start_layer
-    else:
-        start_layer = 0
-
-    if hasattr(model, "end_layer"):
-        end_layer = model.end_layer
-    else:
-        end_layer = len(kv_caches)
+    model_input_subset = create_model_input_subset(
+        model_name, model_executable)
+    model_layers = model_input_subset.model_layers
+    attn_layers = model_input_subset.attn_layers
+    start_layer = model_input_subset.start_layer
+    end_layer = model_input_subset.end_layer
     
     # The following metadata are needed to rebuilt the model input
     full_tokens_list = []
