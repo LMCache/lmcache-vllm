@@ -14,6 +14,7 @@ from lmcache_vllm.vllm_adapter import (
         lmcache_store_kv, lmcache_retrieve_kv, close_lmcache_engine)
 
 from lmcache_vllm.models.llama import inject_llama
+from lmcache_vllm.attention.flash_attn import inject_flash_attn
 
 from lmcache.logging import init_logger
 logger = init_logger(__name__)
@@ -211,3 +212,4 @@ def InitLMCacheEnvironment() -> None:
     vllm.engine.async_llm_engine._log_task_completion = new_log_task_completion
     
     inject_llama()
+    inject_flash_attn()

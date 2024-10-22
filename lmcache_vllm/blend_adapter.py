@@ -15,8 +15,8 @@ from lmcache_vllm.vllm_adapter import ENGINE_NAME
 logger = init_logger(__name__)
 
 # TODO: need to load the special token and recompute ratio from configuration
-TEMP_SPT = torch.tensor([422], dtype = torch.int, device = "cpu")
-RECOMP_RATIO = 0.0
+TEMP_SPT = torch.tensor([422, 422], dtype = torch.int, device = "cpu")
+RECOMP_RATIO = 0.15
 global_blend_retriever = None
 
 @dataclass
@@ -68,6 +68,38 @@ def pre_initialize():
     global global_blend_retriever 
     global_blend_retriever = SPTBlendRetriever(TEMP_SPT, cache_engine, cache_engine.metadata)
 
+
+# MAIN FUNCTIONS
+
+def combine_input_prompt_chunks(
+        prompt_chunks: List[str],
+    ) -> str:
+    """Combine the input chunks by adding the special separators in between
+
+    :param prompt_chunks: A list of input chunks in string
+    :type prompt_chunks: List[str]
+
+    :return: The combined input tensor
+    :rtype: torch.Tensor
+    """
+    # TODO: replace hardcoded "<s>" by `tokenizer.special_tokens['bos_token']`
+    separator = " # #<s> "
+    return separator.join(prompt_chunks)
+
+def append_separator(
+        input_prompt: str
+    ) -> str:
+    """Append the special separator to the input prompt
+
+    :param input_prompt: The input prompt
+    :type input_prompt: str
+
+    :return: The input prompt with the special separator appended
+    :rtype: str
+    """
+    separator = " # #"
+    return input_prompt + separator
+
 def should_process_request(
         input_ids: torch.Tensor,
         attn_metadata: AttentionMetadata,
@@ -78,7 +110,7 @@ def should_process_request(
         return False
 
     # TODO: make this "256" be configurable
-    if len(input_ids) < 256:
+    if len(input_ids) < 15:
         return False
 
     has_prefill = attn_metadata.prefill_metadata is not None
