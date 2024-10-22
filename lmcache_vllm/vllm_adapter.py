@@ -2,8 +2,10 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 from enum import Enum
 import os
 import torch
+import dataclasses
 from copy import deepcopy
 from torch.nn.utils.rnn import pad_sequence
+import torch.distributed as dist
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
@@ -112,6 +114,41 @@ def init_lmcache_engine(
 
     return engine
 
+def broadcast_seq_group_metadata(
+    model_input: "ModelInputForGPUWithSamplingMetadata",
+    is_driver_worker: bool,
+    ) -> "ModelInputForGPUWithSamplingMetadata":
+    """Brodcast the `model_input` from driver worker to non-driver workers.
+
+    :param model_input: The model input for the current request.
+    :type model_input: ModelInputForGPUWithSamplingMetadata
+
+    :param is_driver_worker: Whether the code is executed in driver worker. 
+    :type is_driver_worker: bool
+
+    : return: Original `model_input` if driver_worker.
+              Broadcasted `model_input` otherwise.
+    """
+    # broadcast len of `seq_group_metadata_list`
+    if is_driver_worker:
+        seq_group_len = [len(model_input.seq_group_metadata_list)]
+    else:
+        seq_group_len = [0]
+    dist.broadcast_object_list(seq_group_len, src=0)
+    seq_group_len = seq_group_len[0]
+    
+    # broadcast `seq_group_metadata_list`
+    if is_driver_worker:
+        seq_group_metadata_list = model_input.seq_group_metadata_list
+    else:
+        seq_group_metadata_list = [None] * seq_group_len
+    dist.broadcast_object_list(seq_group_metadata_list , src=0)
+    
+    if is_driver_worker:
+        return model_input
+    else:
+        return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
+
 def close_lmcache_engine() -> None:
     """Close the LMCache engine if it is initialized.
     """
@@ -132,6 +169,8 @@ def lmcache_should_retrieve(
     :return: RetrieveStatus.
     """
 
+    # model_input doesn't have seq_lens in tp
+    # but attn_metadata does
     seq_lens = model_input.attn_metadata.seq_lens
     
     has_engine = LMCacheEngineBuilder.get(ENGINE_NAME) is not None
@@ -151,14 +190,15 @@ def lmcache_should_retrieve(
     # is not and should not be supported here
     # what about multuple chunk prefills in a single batch??
     
+    
     # Assume all chunks are prefills
-    is_all_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
+    is_all_prefill_run = ((attn_meta.num_prefills == len(seq_lens))\
         and prefill_meta is not None)
     if is_all_prefill_run:
         selected_token_indices = model_input.sampling_metadata.selected_token_indices
         if len(selected_token_indices) == 0:
             # There should only be 1 chunk in chunked prefill
-            assert len(model_input.seq_lens) == 1
+            assert len(seq_lens) == 1
             return RetrieveStatus.CHUNK_PREFILL
         
         '''
@@ -189,7 +229,7 @@ def lmcache_should_store(
     :type kv_caches: List[torch.Tensor]
 
     :return: A list of StoreStatus.
-             StoreStatus.PREFILL/DECODE if we should store KV after PREFILL/DECODE.
+             StoreStatus.PREFILL/DECODE/CHUNK_PREFILL if we should store KV after PREFILL/DECODE.
              StoreStatus.NONE if no storing is required.
     """
     seq_lens = model_input.attn_metadata.seq_lens
@@ -217,7 +257,7 @@ def lmcache_should_store(
 
     # FIXME(Jiayi): need to support chunked prefill (batch prefill and decode)
     # check if the current run is prefill
-    is_all_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
+    is_all_prefill_run = ((attn_meta.num_prefills == len(seq_lens))\
         and (prefill_meta is not None))
 
     if is_all_prefill_run:
@@ -226,22 +266,21 @@ def lmcache_should_store(
             # There should only be 1 chunk in chunked prefill
             assert len(seq_lens) == 1
             return [StoreStatus.CHUNK_PREFILL]
-        key = list(model_input.sampling_metadata.seq_groups[0].seq_data.keys())[0]
-        seq_data = model_input.sampling_metadata.seq_groups[0].seq_data[key]
-        prompt_tokens = seq_data.prompt_token_ids
         
-        if len(prompt_tokens)-1 != selected_token_indices[0]:
-            # last chunk in chunk prefill
-            assert len(seq_lens) == 1
-            return [StoreStatus.NONE]
+        seq_group_metadata_list = model_input.seq_group_metadata_list
+        for seq_group_idx, seq_group_metadata in enumerate(seq_group_metadata_list):
+            for seqid, seq_data in seq_group_metadata.seq_data.items():
+                if seq_data.get_len()-1 != selected_token_indices[0]:
+                    # last chunk in chunk prefill
+                    assert len(seq_lens) == 1
+                    return [StoreStatus.NONE]
+        
         return [StoreStatus.PREFILL] * len(seq_lens)
         
 
     # Determine whether to save decoded KV cache
     #seq_groups = model_input.sampling_metadata.seq_groups
     if engine.save_decode_cache:
-        seq_lens = model_input.attn_metadata.seq_lens
-
         for idx, seq_len in enumerate(seq_lens):
             if seq_len % engine.chunk_size == 0:
                 store_status[idx] = StoreStatus.DECODE
@@ -287,8 +326,9 @@ def lmcache_store_kv(
 
 
     seq_data_idx = 0
-
+    
     seq_group_metadata_list = model_input.seq_group_metadata_list
+    
     for seq_group_idx, seq_group_metadata in enumerate(seq_group_metadata_list):
         status = store_status[seq_group_idx]
         for seqid, seq_data in seq_group_metadata.seq_data.items():
@@ -391,13 +431,15 @@ def lmcache_retrieve_kv(
     
     start_pos_list = []
     is_prefill_list = []
-    seq_group_metadata_list = model_input.seq_group_metadata_list
+     
     next_start_pos = 0
     num_request_not_found = 0
     temp_block_table_list = []
     
     # idx is on a sequence, not a sequence group.
     idx = 0
+
+    seq_group_metadata_list = model_input.seq_group_metadata_list
 
     for seq_group_metadata in seq_group_metadata_list:
         request_id = seq_group_metadata.request_id

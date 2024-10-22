@@ -3,7 +3,9 @@ This version works with vllm-0.6.1.post2
 """
 from functools import wraps
 import torch
+import os
 import asyncio
+import dataclasses
 from typing import Optional, List
 
 from vllm.multimodal import MultiModalInputs
@@ -14,7 +16,7 @@ from vllm.distributed import get_pp_group
 from lmcache_vllm.vllm_adapter import (
         init_lmcache_engine, lmcache_should_store, lmcache_should_retrieve,
         lmcache_store_kv, lmcache_retrieve_kv, close_lmcache_engine,
-        StoreStatus, RetrieveStatus)
+        broadcast_seq_group_metadata, StoreStatus, RetrieveStatus)
 
 from lmcache.logging import init_logger
 logger = init_logger(__name__)
@@ -30,6 +32,10 @@ def new_execute_model(
 ): 
     init_lmcache_engine(self.model_config, self.parallel_config, self.cache_config)
 
+    # TODO(Jiayi): broadcast the necessary `seq_group_metadata` in every model
+    # execution. Maybe there's a more efficient way.
+    model_input = broadcast_seq_group_metadata(model_input, self.is_driver_worker)
+    
     # LMCache retrieval
     retrieve_status = lmcache_should_retrieve(model_input, kv_caches)
     is_skip = False
@@ -84,7 +90,7 @@ def new_execute_model(
             graph_batch_size]
     else:
         model_executable = self.model
- 
+
     multi_modal_kwargs = model_input.multi_modal_kwargs or {}
     seqlen_agnostic_kwargs = {
         "finished_requests_ids": model_input.finished_requests_ids,
@@ -283,7 +289,7 @@ def wrap_prepare_model_input(
     global original_prepare_model_input
     model_input = original_prepare_model_input(
         self, seq_group_metadata_list, virtual_engine, finished_requests_ids)
-    import dataclasses
+
     # NOTE(Sixian): Use seq_group_metadata_list because
     # sampling_metadata is only available
     # at the last stage of pipeline parallelism stages.
@@ -292,6 +298,7 @@ def wrap_prepare_model_input(
 def InitLMCacheEnvironment() -> None:
     """Initialize the LMCache environment.
     """
+    
     import vllm.worker.model_runner 
     vllm.worker.model_runner.ModelRunner.execute_model = new_execute_model
 
