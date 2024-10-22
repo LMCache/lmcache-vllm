@@ -99,7 +99,7 @@ def broadcast_seq_group_metadata(
     :param is_driver_worker: Whether the code is executed in driver worker. 
     :type is_driver_worker: bool
 
-    : return: Original `model_input` if driver_worker,
+    : return: Original `model_input` if driver_worker.
               Broadcasted `model_input` otherwise.
     """
     # broadcast len of `seq_group_metadata_list`
