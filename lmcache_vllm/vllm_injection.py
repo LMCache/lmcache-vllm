@@ -127,11 +127,6 @@ def new_execute_model(
             lmcache_store_kv(model_executable, model_input, self.cache_config,
                             kv_caches, store_status)
 
-
-    # LMCache storing
-    if lmcache_should_store(model_input, kv_caches):
-        lmcache_store_kv(model_executable, model_input, kv_caches)
- 
     # CacheBlend updates
     if hasattr(model_input.attn_metadata, "blend_metadata") and\
             model_input.attn_metadata.blend_metadata.selected_token_indices is not None:
