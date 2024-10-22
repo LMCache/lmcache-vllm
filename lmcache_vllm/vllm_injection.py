@@ -28,7 +28,7 @@ def new_execute_model(
     intermediate_tensors,
     num_steps: int = 1,
 ): 
-    init_lmcache_engine(self.model_config, self.parallel_config)
+    init_lmcache_engine(self.model_config, self.parallel_config, self.cache_config)
 
     # LMCache retrieval
     retrieve_status = lmcache_should_retrieve(model_input, kv_caches)

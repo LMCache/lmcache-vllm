@@ -11,6 +11,8 @@ if TYPE_CHECKING:
 from vllm import _custom_ops as ops
 from vllm.sequence import SequenceGroupMetadata
 from vllm.config import ModelConfig, ParallelConfig, CacheConfig
+from vllm.distributed import get_pp_group
+from vllm.utils import get_kv_cache_torch_dtype
 
 from lmcache.logging import init_logger
 from lmcache.cache_engine import LMCacheEngine, LMCacheEngineBuilder
@@ -22,6 +24,19 @@ logger = init_logger(__name__)
 
 ENGINE_NAME = "vllm-instance"
 LMCACHE_CUDA_STREAM = torch.cuda.Stream()
+
+TORCH_DTYPE_TO_STR_DTYPE = {
+    torch.half: "half",
+    torch.float16: "half",
+    torch.bfloat16: "bfloat16",
+    torch.float: "float",
+    torch.float32: "float",
+    torch.float64: "double",
+    torch.double: "double",
+    torch.uint8: "fp8",
+    torch.float8_e4m3fn: "fp8_e4m3", 
+    torch.float8_e5m2: "fp8_e5m2",
+}
 
 class StoreStatus(Enum):
     PREFILL = 1
@@ -39,6 +54,7 @@ class RetrieveStatus(Enum):
 def init_lmcache_engine(
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
+        cache_config: CacheConfig,
     ) -> Optional[LMCacheEngine]:
     """Initialize the LMCache engine by the given model config and parallel 
     config. This function will check the environment variable 
@@ -49,6 +65,8 @@ def init_lmcache_engine(
     :type model_config: ModelConfig
     :param parallel_config: The parallel configuration in vLLM.
     :type parallel_config: ParallelConfig
+    :param cache_config: The KV cache configuration in vLLM.
+    :type cache_config: CacheConfig
 
     :return: The initialized LMCache engine or None (if the environment variable
         `LMCACHE_CONFIG_FILE` is not set).
@@ -71,12 +89,21 @@ def init_lmcache_engine(
         config_file = os.environ["LMCACHE_CONFIG_FILE"]
         logger.info(f"Loading LMCache config file {config_file}")
         config = LMCacheEngineConfig.from_file(config_file)
-    
+
+    # If KV cache's dtype is "auto", enforce it to be the same with model's dtype
+    if cache_config.cache_dtype == "auto":
+        kv_cache_torch_dtype = get_kv_cache_torch_dtype(cache_config.cache_dtype,
+                                                        model_config.dtype)
+        kv_cache_str_dtype = TORCH_DTYPE_TO_STR_DTYPE[kv_cache_torch_dtype]
+    else:
+        kv_cache_str_dtype = cache_config.cache_dtype
+
     metadata = LMCacheEngineMetadata(
             model_config.model,
             parallel_config.world_size,
             parallel_config.rank,
-            "vllm")
+            "vllm",
+            kv_cache_str_dtype)
     
     engine = LMCacheEngineBuilder.get_or_create(
             ENGINE_NAME,
