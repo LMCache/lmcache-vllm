@@ -13,7 +13,7 @@ from vllm.lora.request import LoRARequest
 from vllm.worker.model_runner_base import dump_input_when_exception
 from vllm.distributed import get_pp_group
 
-from lmcache_vllm.vllm_adapter import (
+from lmcache_vllm.vllm_adapter import (lmcache_get_config,
         init_lmcache_engine, lmcache_should_store, lmcache_should_retrieve,
         lmcache_store_kv, lmcache_retrieve_kv, close_lmcache_engine,
         broadcast_seq_group_metadata, StoreStatus, RetrieveStatus)
@@ -128,7 +128,8 @@ def new_execute_model(
                             kv_caches, store_status)
 
     # CacheBlend updates
-    if hasattr(model_input.attn_metadata, "blend_metadata") and\
+    if lmcache_get_config().enable_blending and \
+            hasattr(model_input.attn_metadata, "blend_metadata") and \
             model_input.attn_metadata.blend_metadata.selected_token_indices is not None:
         new_selected_token_indices = \
                 model_input.attn_metadata.blend_metadata.selected_token_indices
@@ -326,5 +327,6 @@ def InitLMCacheEnvironment() -> None:
     vllm.inputs.preprocess.InputPreprocessor._tokenize_prompt_async = _new_tokenize_prompt_async
     
     # Cacheblend
-    inject_llama()
-    inject_flash_attn()
+    if lmcache_get_config().enable_blending:
+        inject_llama()
+        inject_flash_attn()
