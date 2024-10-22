@@ -88,9 +88,20 @@ def init_lmcache_engine(
     return engine
 
 def broadcast_seq_group_metadata(
-    model_input,
-    is_driver_worker,
-):
+    model_input: "ModelInputForGPUWithSamplingMetadata",
+    is_driver_worker: bool,
+    ) -> "ModelInputForGPUWithSamplingMetadata":
+    """Brodcast the `model_input` from driver worker to non-driver workers.
+
+    :param model_input: The model input for the current request.
+    :type model_input: ModelInputForGPUWithSamplingMetadata
+
+    :param is_driver_worker: Whether the code is executed in driver worker. 
+    :type is_driver_worker: bool
+
+    : return: Original `model_input` if driver_worker,
+              Broadcasted `model_input` otherwise.
+    """
     # broadcast len of `seq_group_metadata_list`
     if is_driver_worker:
         seq_group_len = [len(model_input.seq_group_metadata_list)]
@@ -106,7 +117,10 @@ def broadcast_seq_group_metadata(
         seq_group_metadata_list = [None] * seq_group_len
     dist.broadcast_object_list(seq_group_metadata_list , src=0)
     
-    return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
+    if is_driver_worker:
+        return model_input
+    else:
+        return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
 
 def close_lmcache_engine() -> None:
     """Close the LMCache engine if it is initialized.
