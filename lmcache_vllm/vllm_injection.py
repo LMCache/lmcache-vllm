@@ -31,7 +31,7 @@ def new_execute_model(
     intermediate_tensors,
     num_steps: int = 1,
 ): 
-    init_lmcache_engine(self.model_config, self.parallel_config)
+    init_lmcache_engine(self.model_config, self.parallel_config, self.cache_config)
 
     # TODO(Jiayi): broadcast the necessary `seq_group_metadata` in every model
     # execution. Maybe there's a more efficient way.
