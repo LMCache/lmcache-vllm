@@ -19,6 +19,7 @@ from vllm.sequence import SequenceGroupMetadata
 from vllm.config import ModelConfig, ParallelConfig, CacheConfig
 from vllm.distributed import get_pp_group
 from vllm.utils import get_kv_cache_torch_dtype
+from vllm.attention.backends.utils import compute_slot_mapping
 
 from lmcache.logging import init_logger
 from lmcache.cache_engine import LMCacheEngine, LMCacheEngineBuilder
@@ -424,7 +425,6 @@ def lmcache_store_kv(
                 if seq_len % engine.chunk_size != 0:
                     continue
             
-            from vllm.attention.backends.utils import compute_slot_mapping
             slot_mapping = []
             compute_slot_mapping(False, slot_mapping, seqid, seq_len, 
                 0, skip_leading_tokens, vllm_block_size, seq_group_metadata.block_tables)
