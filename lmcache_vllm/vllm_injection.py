@@ -16,7 +16,8 @@ from vllm.distributed import get_pp_group
 from lmcache_vllm.vllm_adapter import (
         init_lmcache_engine, lmcache_should_store, lmcache_should_retrieve,
         lmcache_store_kv, lmcache_retrieve_kv, close_lmcache_engine,
-        broadcast_seq_group_metadata, StoreStatus, RetrieveStatus)
+        broadcast_seq_group_metadata, StoreStatus, RetrieveStatus,
+        SUPPORTED_MODELS)
 
 from lmcache.logging import init_logger
 logger = init_logger(__name__)
@@ -42,7 +43,7 @@ def new_execute_model(
     if retrieve_status != RetrieveStatus.NONE:
         logger.info(f"KV cache retrieving mode: {retrieve_status}")
         model_input, is_skip = lmcache_retrieve_kv(
-            self.model, model_input, kv_caches, retrieve_status)
+            self.model, self.model_config.model, model_input, kv_caches, retrieve_status)
 
         if is_skip:
             logger.debug("Prefill is entirely skipped")
@@ -196,18 +197,20 @@ def new_execute_model(
  
     return [output]
 
-def _remove_empty_token(
+def _patch_padding_space(
     tokenizer_id: str,
-    res: List[int],
-) -> List[int]:
+    prompt: str,
+) -> str:
     """
-    remove empty tokens to enable caching decode KV cache
+    patch padding tokens to enable caching decode KV cache
     """
-    mistral_family = ['mistralai/Mistral-7B-Instruct-v0.2']
-    if tokenizer_id in mistral_family:
-        empty_token = 28705
-        res = [x for x in res if x != empty_token]
-    return res
+    if tokenizer_id in SUPPORTED_MODELS.mistral_family:
+        prompt = prompt.replace("[/INST]  ", "[/INST] ")
+    elif tokenizer_id in SUPPORTED_MODELS.llama_family:
+        prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    elif tokenizer_id in SUPPORTED_MODELS.glm_family:
+        prompt += "<|assistant|>\n"
+    return prompt
 
 def _new_tokenize_prompt(
     self,
@@ -221,13 +224,15 @@ def _new_tokenize_prompt(
     """
     tokenizer = self.get_tokenizer_group()
 
+    # Jiayi: Patch starts here
+    tokenizer_id = tokenizer.tokenizer_id
+    prompt = _patch_padding_space(tokenizer_id, prompt)
+    # Jiayi: Patch ends here
+
     res = tokenizer.encode(request_id=request_id,
                             prompt=prompt,
                             lora_request=lora_request)
     
-    # Jiayi: Patch starts here
-    tokenizer_id = tokenizer.tokenizer_id
-    res = _remove_empty_token(tokenizer_id, res)
     return res
 
 async def _new_tokenize_prompt_async(
@@ -239,13 +244,15 @@ async def _new_tokenize_prompt_async(
     """Async version of :meth:`_tokenize_prompt`."""
     tokenizer = self.get_tokenizer_group()
 
+    # Jiayi: Patch starts here
+    tokenizer_id = tokenizer.tokenizer_id
+    prompt = _patch_padding_space(tokenizer_id, prompt)
+    # Jiayi: Patch ends here
+
     res = await tokenizer.encode_async(request_id=request_id,
                                         prompt=prompt,
                                         lora_request=lora_request)
     
-    # Jiayi: Patch starts here
-    tokenizer_id = tokenizer.tokenizer_id
-    res = _remove_empty_token(tokenizer_id, res)
     return res
 
 def new_log_task_completion(task: asyncio.Task,

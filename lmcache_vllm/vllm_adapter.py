@@ -1,4 +1,5 @@
 from typing import TYPE_CHECKING, List, Optional, Tuple
+from types import SimpleNamespace
 from enum import Enum
 import os
 import torch
@@ -44,7 +45,8 @@ class StoreStatus(Enum):
     PREFILL = 1
     CHUNK_PREFILL = 2
     DECODE = 3
-    NONE = 4
+    SUFFIX_PREFILL = 4
+    NONE = 5
 
 class RetrieveStatus(Enum):
     PREFILL = 1
@@ -52,6 +54,13 @@ class RetrieveStatus(Enum):
     CHUNK_PREFILL_LAST = 3
     NONE = 4
 
+SUPPORTED_MODELS = SimpleNamespace(
+    llama_family = ["meta-llama/Llama-3.1-8B-Instruct"],
+    longchat_family = ["lmsys/longchat-7b-16k"],
+    mistral_family = ["mistralai/Mistral-7B-Instruct-v0.2"],
+    glm_family = ["THUDM/glm-4-9b-chat"],
+    qwen_family = ["Qwen/Qwen-7B"],
+)
 
 def init_lmcache_engine(
         model_config: ModelConfig,
@@ -144,10 +153,7 @@ def broadcast_seq_group_metadata(
         seq_group_metadata_list = [None] * seq_group_len
     dist.broadcast_object_list(seq_group_metadata_list , src=0)
     
-    if is_driver_worker:
-        return model_input
-    else:
-        return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
+    return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
 
 def close_lmcache_engine() -> None:
     """Close the LMCache engine if it is initialized.
@@ -268,13 +274,17 @@ def lmcache_should_store(
             return [StoreStatus.CHUNK_PREFILL]
         
         seq_group_metadata_list = model_input.seq_group_metadata_list
+        idx = 0
         for seq_group_idx, seq_group_metadata in enumerate(seq_group_metadata_list):
             for seqid, seq_data in seq_group_metadata.seq_data.items():
                 if seq_data.get_len()-1 != selected_token_indices[0]:
                     # last chunk in chunk prefill
-                    assert len(seq_lens) == 1
-                    return [StoreStatus.NONE]
-        return [StoreStatus.PREFILL] * len(seq_lens)
+                    # or prefix already hit in retrieve
+                    store_status[idx] = StoreStatus.SUFFIX_PREFILL
+                else:
+                    store_status[idx] = StoreStatus.PREFILL
+                idx += 1
+        return store_status
         
 
     # Determine whether to save decoded KV cache
@@ -312,12 +322,18 @@ def lmcache_store_kv(
 
     seq_lens = model_input.attn_metadata.seq_lens
         
-    if hasattr(model_executable.model, "start_layer"):
+    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
+    # How does PP work in this case?
+    if hasattr(model_executable, "model") and \
+        hasattr(model_executable.model, "start_layer"):
         start_layer = model_executable.model.start_layer
     else:
         start_layer = 0
 
-    if hasattr(model_executable.model, "end_layer"):
+    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
+    # How does PP work in this case?
+    if hasattr(model_executable, "model") and \
+        hasattr(model_executable.model, "start_layer"):
         end_layer = model_executable.model.end_layer
     else:
         end_layer = len(kv_caches)
@@ -328,7 +344,7 @@ def lmcache_store_kv(
         for seqid, seq_data in seq_group_metadata.seq_data.items():
             status = store_status[seq_data_idx]
             # TODO (Jiayi): can chunk prefill and vllm prefix caching use the same logic?
-            if status == StoreStatus.CHUNK_PREFILL:
+            if status in [StoreStatus.CHUNK_PREFILL, StoreStatus.SUFFIX_PREFILL]:
                 seq_len = seq_lens[seq_data_idx]
             else:
                 seq_len = seq_data.get_len()
@@ -372,6 +388,7 @@ def lmcache_store_kv(
 @_lmcache_nvtx_annotate
 def lmcache_retrieve_kv(
     model_executable,
+    model_name: str,
     model_input: "ModelInputForGPUWithSamplingMetadata",
     kv_caches: List[torch.Tensor],
     retrieve_status: RetrieveStatus,
@@ -404,13 +421,30 @@ def lmcache_retrieve_kv(
     slot_mapping = model_input.attn_metadata.slot_mapping.flatten()
     seq_lens = model_input.attn_metadata.seq_lens
 
-    if hasattr(model_executable.model, "start_layer"):
-        start_layer = model_executable.model.start_layer
+    if model_name in SUPPORTED_MODELS.llama_family or \
+        model_name in SUPPORTED_MODELS.mistral_family:
+        model = model_executable.model
+        model_layers = model.layers
+        attn_layers = [layer.self_attn for layer in model_layers]
+    elif model_name in SUPPORTED_MODELS.glm_family:
+        model = model_executable.transformer
+        model_layers = model.encoder.layers
+        attn_layers = [layer.self_attention for layer in model_layers]
+    else:
+        # FIXME(Jiayi): `else` is the default setting, which could be wrong
+        model = model_executable.model
+        model_layers = model.layers
+        attn_layers = [layer.self_attn for layer in model_layers]
+
+    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
+    # How does PP work in this case?
+    if hasattr(model, "start_layer"):
+        start_layer = model.start_layer
     else:
         start_layer = 0
 
-    if hasattr(model_executable.model, "end_layer"):
-        end_layer = model_executable.model.end_layer
+    if hasattr(model, "end_layer"):
+        end_layer = model.end_layer
     else:
         end_layer = len(kv_caches)
     
@@ -497,7 +531,7 @@ def lmcache_retrieve_kv(
             for i in range(start_layer, end_layer):
                 layer_idx = i - start_layer
                 kv_cache = kv_caches[layer_idx]
-                layer = model_executable.model.layers[i]
+                attn_layer = attn_layers[i]
                 key_cache, value_cache = kv_cache[0], kv_cache[1]
                 ops.reshape_and_cache_flash(
                     kv_tuple[layer_idx][0].to(key_cache.device),
@@ -505,9 +539,9 @@ def lmcache_retrieve_kv(
                     key_cache,
                     value_cache,
                     slot_mapping[start_pos:start_pos + lmc_num_computed_tokens],
-                    layer.self_attn.attn.kv_cache_dtype,
-                    layer.self_attn.attn._k_scale,
-                    layer.self_attn.attn._v_scale,
+                    attn_layer.attn.kv_cache_dtype,
+                    attn_layer.attn._k_scale,
+                    attn_layer.attn._v_scale,
                 )
             
             idx += 1
