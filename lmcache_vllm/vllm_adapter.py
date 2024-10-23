@@ -2,8 +2,10 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 from enum import Enum
 import os
 import torch
+import dataclasses
 from copy import deepcopy
 from torch.nn.utils.rnn import pad_sequence
+import torch.distributed as dist
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
@@ -11,6 +13,8 @@ if TYPE_CHECKING:
 from vllm import _custom_ops as ops
 from vllm.sequence import SequenceGroupMetadata
 from vllm.config import ModelConfig, ParallelConfig, CacheConfig
+from vllm.distributed import get_pp_group
+from vllm.utils import get_kv_cache_torch_dtype
 
 from lmcache.logging import init_logger
 from lmcache.cache_engine import LMCacheEngine, LMCacheEngineBuilder
@@ -22,6 +26,19 @@ logger = init_logger(__name__)
 
 ENGINE_NAME = "vllm-instance"
 LMCACHE_CUDA_STREAM = torch.cuda.Stream()
+
+TORCH_DTYPE_TO_STR_DTYPE = {
+    torch.half: "half",
+    torch.float16: "half",
+    torch.bfloat16: "bfloat16",
+    torch.float: "float",
+    torch.float32: "float",
+    torch.float64: "double",
+    torch.double: "double",
+    torch.uint8: "fp8",
+    torch.float8_e4m3fn: "fp8_e4m3", 
+    torch.float8_e5m2: "fp8_e5m2",
+}
 
 class StoreStatus(Enum):
     PREFILL = 1
@@ -39,6 +56,7 @@ class RetrieveStatus(Enum):
 def init_lmcache_engine(
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
+        cache_config: CacheConfig,
     ) -> Optional[LMCacheEngine]:
     """Initialize the LMCache engine by the given model config and parallel 
     config. This function will check the environment variable 
@@ -49,6 +67,8 @@ def init_lmcache_engine(
     :type model_config: ModelConfig
     :param parallel_config: The parallel configuration in vLLM.
     :type parallel_config: ParallelConfig
+    :param cache_config: The KV cache configuration in vLLM.
+    :type cache_config: CacheConfig
 
     :return: The initialized LMCache engine or None (if the environment variable
         `LMCACHE_CONFIG_FILE` is not set).
@@ -72,11 +92,20 @@ def init_lmcache_engine(
         logger.info(f"Loading LMCache config file {config_file}")
         config = LMCacheEngineConfig.from_file(config_file)
     
+    # If KV cache's dtype is "auto", enforce it to be the same with model's dtype
+    if cache_config.cache_dtype == "auto":
+        kv_cache_torch_dtype = get_kv_cache_torch_dtype(cache_config.cache_dtype,
+                                                        model_config.dtype)
+        kv_cache_str_dtype = TORCH_DTYPE_TO_STR_DTYPE[kv_cache_torch_dtype]
+    else:
+        kv_cache_str_dtype = cache_config.cache_dtype
+
     metadata = LMCacheEngineMetadata(
             model_config.model,
             parallel_config.world_size,
             parallel_config.rank,
-            "vllm")
+            "vllm",
+            kv_cache_str_dtype)
     
     engine = LMCacheEngineBuilder.get_or_create(
             ENGINE_NAME,
@@ -84,6 +113,41 @@ def init_lmcache_engine(
             metadata)
 
     return engine
+
+def broadcast_seq_group_metadata(
+    model_input: "ModelInputForGPUWithSamplingMetadata",
+    is_driver_worker: bool,
+    ) -> "ModelInputForGPUWithSamplingMetadata":
+    """Brodcast the `model_input` from driver worker to non-driver workers.
+
+    :param model_input: The model input for the current request.
+    :type model_input: ModelInputForGPUWithSamplingMetadata
+
+    :param is_driver_worker: Whether the code is executed in driver worker. 
+    :type is_driver_worker: bool
+
+    : return: Original `model_input` if driver_worker.
+              Broadcasted `model_input` otherwise.
+    """
+    # broadcast len of `seq_group_metadata_list`
+    if is_driver_worker:
+        seq_group_len = [len(model_input.seq_group_metadata_list)]
+    else:
+        seq_group_len = [0]
+    dist.broadcast_object_list(seq_group_len, src=0)
+    seq_group_len = seq_group_len[0]
+    
+    # broadcast `seq_group_metadata_list`
+    if is_driver_worker:
+        seq_group_metadata_list = model_input.seq_group_metadata_list
+    else:
+        seq_group_metadata_list = [None] * seq_group_len
+    dist.broadcast_object_list(seq_group_metadata_list , src=0)
+    
+    if is_driver_worker:
+        return model_input
+    else:
+        return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
 
 def close_lmcache_engine() -> None:
     """Close the LMCache engine if it is initialized.
@@ -105,6 +169,9 @@ def lmcache_should_retrieve(
     :return: RetrieveStatus.
     """
 
+    # model_input doesn't have seq_lens in tp
+    # but attn_metadata does
+    seq_lens = model_input.attn_metadata.seq_lens
     
     has_engine = LMCacheEngineBuilder.get(ENGINE_NAME) is not None
     if not has_engine or kv_caches is None:
@@ -123,14 +190,15 @@ def lmcache_should_retrieve(
     # is not and should not be supported here
     # what about multuple chunk prefills in a single batch??
     
+
     # Assume all chunks are prefills
-    is_all_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
+    is_all_prefill_run = ((attn_meta.num_prefills == len(seq_lens))\
         and prefill_meta is not None)
     if is_all_prefill_run:
         selected_token_indices = model_input.sampling_metadata.selected_token_indices
         if len(selected_token_indices) == 0:
             # There should only be 1 chunk in chunked prefill
-            assert len(model_input.seq_lens) == 1
+            assert len(seq_lens) == 1
             return RetrieveStatus.CHUNK_PREFILL
         
         '''
@@ -161,7 +229,7 @@ def lmcache_should_store(
     :type kv_caches: List[torch.Tensor]
 
     :return: A list of StoreStatus.
-             StoreStatus.PREFILL/DECODE if we should store KV after PREFILL/DECODE.
+             StoreStatus.PREFILL/DECODE/CHUNK_PREFILL if we should store KV after PREFILL/DECODE.
              StoreStatus.NONE if no storing is required.
     """
     seq_lens = model_input.attn_metadata.seq_lens
@@ -189,7 +257,7 @@ def lmcache_should_store(
 
     # FIXME(Jiayi): need to support chunked prefill (batch prefill and decode)
     # check if the current run is prefill
-    is_all_prefill_run = ((attn_meta.num_prefills == len(model_input.seq_lens))\
+    is_all_prefill_run = ((attn_meta.num_prefills == len(seq_lens))\
         and (prefill_meta is not None))
 
     if is_all_prefill_run:
@@ -198,14 +266,19 @@ def lmcache_should_store(
             # There should only be 1 chunk in chunked prefill
             assert len(seq_lens) == 1
             return [StoreStatus.CHUNK_PREFILL]
+        
+        seq_group_metadata_list = model_input.seq_group_metadata_list
+        for seq_group_idx, seq_group_metadata in enumerate(seq_group_metadata_list):
+            for seqid, seq_data in seq_group_metadata.seq_data.items():
+                if seq_data.get_len()-1 != selected_token_indices[0]:
+                    # last chunk in chunk prefill
+                    assert len(seq_lens) == 1
+                    return [StoreStatus.NONE]
         return [StoreStatus.PREFILL] * len(seq_lens)
         
 
     # Determine whether to save decoded KV cache
-    #seq_groups = model_input.sampling_metadata.seq_groups
     if engine.save_decode_cache:
-        seq_lens = model_input.attn_metadata.seq_lens
-
         for idx, seq_len in enumerate(seq_lens):
             if seq_len % engine.chunk_size == 0:
                 store_status[idx] = StoreStatus.DECODE
