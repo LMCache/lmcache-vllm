@@ -6,6 +6,9 @@ import torch
 import dataclasses
 from copy import deepcopy
 from torch.nn.utils.rnn import pad_sequence
+from dataclasses import dataclass
+from torch import nn
+
 import torch.distributed as dist
 
 if TYPE_CHECKING:
@@ -14,6 +17,8 @@ if TYPE_CHECKING:
 from vllm import _custom_ops as ops
 from vllm.sequence import SequenceGroupMetadata
 from vllm.config import ModelConfig, ParallelConfig, CacheConfig
+from vllm.distributed import get_pp_group
+from vllm.utils import get_kv_cache_torch_dtype
 
 from lmcache.logging import init_logger
 from lmcache.cache_engine import LMCacheEngine, LMCacheEngineBuilder
@@ -25,6 +30,19 @@ logger = init_logger(__name__)
 
 ENGINE_NAME = "vllm-instance"
 LMCACHE_CUDA_STREAM = torch.cuda.Stream()
+
+TORCH_DTYPE_TO_STR_DTYPE = {
+    torch.half: "half",
+    torch.float16: "half",
+    torch.bfloat16: "bfloat16",
+    torch.float: "float",
+    torch.float32: "float",
+    torch.float64: "double",
+    torch.double: "double",
+    torch.uint8: "fp8",
+    torch.float8_e4m3fn: "fp8_e4m3", 
+    torch.float8_e5m2: "fp8_e5m2",
+}
 
 class StoreStatus(Enum):
     PREFILL = 1
@@ -47,9 +65,59 @@ SUPPORTED_MODELS = SimpleNamespace(
     qwen_family = ["Qwen/Qwen-7B"],
 )
 
+@dataclass
+class ModelInputSubset:
+    model_layers: List[nn.Module]
+    attn_layers: List[nn.Module]
+    start_layer: int
+    end_layer: int
+    
+
+def create_model_input_subset(
+    model_name: str,
+    model_executable: "ModelInputForGPUWithSamplingMetadata",
+) -> ModelInputSubset:
+    if model_name in SUPPORTED_MODELS.llama_family or \
+        model_name in SUPPORTED_MODELS.mistral_family:
+        model = model_executable.model
+        model_layers = model.layers
+        attn_layers = [layer.self_attn for layer in model_layers]
+    elif model_name in SUPPORTED_MODELS.glm_family:
+        model = model_executable.transformer
+        model_layers = model.encoder.layers
+        attn_layers = [layer.self_attention for layer in model_layers]
+    else:
+        # FIXME(Jiayi): `else` is the default setting, which could be wrong
+        model = model_executable.model
+        model_layers = model.layers
+        attn_layers = [layer.self_attn for layer in model_layers]
+    
+    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
+    # How does PP work in this case?
+    if hasattr(model, "start_layer"):
+        start_layer = model.start_layer
+    else:
+        start_layer = 0
+
+    if hasattr(model, "end_layer"):
+        end_layer = model.end_layer
+    else:
+        end_layer = len(model_layers)
+    
+    model_input_subset = ModelInputSubset(
+        model_layers=model_layers,
+        attn_layers=attn_layers,
+        start_layer=start_layer,
+        end_layer=end_layer
+    )
+    
+    return model_input_subset
+
+
 def init_lmcache_engine(
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
+        cache_config: CacheConfig,
     ) -> Optional[LMCacheEngine]:
     """Initialize the LMCache engine by the given model config and parallel 
     config. This function will check the environment variable 
@@ -60,6 +128,8 @@ def init_lmcache_engine(
     :type model_config: ModelConfig
     :param parallel_config: The parallel configuration in vLLM.
     :type parallel_config: ParallelConfig
+    :param cache_config: The KV cache configuration in vLLM.
+    :type cache_config: CacheConfig
 
     :return: The initialized LMCache engine or None (if the environment variable
         `LMCACHE_CONFIG_FILE` is not set).
@@ -82,12 +152,21 @@ def init_lmcache_engine(
         config_file = os.environ["LMCACHE_CONFIG_FILE"]
         logger.info(f"Loading LMCache config file {config_file}")
         config = LMCacheEngineConfig.from_file(config_file)
-    
+
+    # If KV cache's dtype is "auto", enforce it to be the same with model's dtype
+    if cache_config.cache_dtype == "auto":
+        kv_cache_torch_dtype = get_kv_cache_torch_dtype(cache_config.cache_dtype,
+                                                        model_config.dtype)
+        kv_cache_str_dtype = TORCH_DTYPE_TO_STR_DTYPE[kv_cache_torch_dtype]
+    else:
+        kv_cache_str_dtype = cache_config.cache_dtype
+
     metadata = LMCacheEngineMetadata(
             model_config.model,
             parallel_config.world_size,
             parallel_config.rank,
-            "vllm")
+            "vllm",
+            kv_cache_str_dtype)
     
     engine = LMCacheEngineBuilder.get_or_create(
             ENGINE_NAME,
@@ -97,9 +176,21 @@ def init_lmcache_engine(
     return engine
 
 def broadcast_seq_group_metadata(
-    model_input,
-    is_driver_worker,
-):
+    model_input: "ModelInputForGPUWithSamplingMetadata",
+    is_driver_worker: bool,
+    ) -> "ModelInputForGPUWithSamplingMetadata":
+    """Brodcast the `model_input` from driver worker to non-driver workers.
+
+    :param model_input: The model input for the current request.
+    :type model_input: ModelInputForGPUWithSamplingMetadata
+
+    :param is_driver_worker: Whether the code is executed in driver worker. 
+    :type is_driver_worker: bool
+
+    : return: Original `model_input` if driver_worker.
+              Broadcasted `model_input` otherwise.
+    """
+
     # broadcast len of `seq_group_metadata_list`
     if is_driver_worker:
         seq_group_len = [len(model_input.seq_group_metadata_list)]
@@ -115,7 +206,10 @@ def broadcast_seq_group_metadata(
         seq_group_metadata_list = [None] * seq_group_len
     dist.broadcast_object_list(seq_group_metadata_list , src=0)
     
-    return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
+    if is_driver_worker:
+        return model_input
+    else:
+        return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
 
 def close_lmcache_engine() -> None:
     """Close the LMCache engine if it is initialized.
@@ -237,6 +331,7 @@ def lmcache_should_store(
         
         seq_group_metadata_list = model_input.seq_group_metadata_list
         idx = 0
+
         for seq_group_idx, seq_group_metadata in enumerate(seq_group_metadata_list):
             for seqid, seq_data in seq_group_metadata.seq_data.items():
                 if seq_data.get_len()-1 != selected_token_indices[0]:
@@ -385,40 +480,16 @@ def lmcache_retrieve_kv(
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
     assert engine is not None, "LMCache engine is not initialized."
 
-    
-    # This is disagg decode instance, during prefill state
-    # Need to receive KV from the prefill instance
     query_start_loc = model_input.attn_metadata.query_start_loc
     slot_mapping = model_input.attn_metadata.slot_mapping.flatten()
     seq_lens = model_input.attn_metadata.seq_lens
 
-    
-    if model_name in SUPPORTED_MODELS.llama_family or \
-        model_name in SUPPORTED_MODELS.mistral_family:
-        model = model_executable.model
-        model_layers = model.layers
-        attn_layers = [layer.self_attn for layer in model_layers]
-    elif model_name in SUPPORTED_MODELS.glm_family:
-        model = model_executable.transformer
-        model_layers = model.encoder.layers
-        attn_layers = [layer.self_attention for layer in model_layers]
-    else:
-        # FIXME(Jiayi): `else` is the default setting, which could be wrong
-        model = model_executable.model
-        model_layers = model.layers
-        attn_layers = [layer.self_attn for layer in model_layers]
-    
-    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
-    # How does PP work in this case?
-    if hasattr(model, "start_layer"):
-        start_layer = model.start_layer
-    else:
-        start_layer = 0
-
-    if hasattr(model, "end_layer"):
-        end_layer = model.end_layer
-    else:
-        end_layer = len(kv_caches)
+    model_input_subset = create_model_input_subset(
+        model_name, model_executable)
+    model_layers = model_input_subset.model_layers
+    attn_layers = model_input_subset.attn_layers
+    start_layer = model_input_subset.start_layer
+    end_layer = model_input_subset.end_layer
     
     # The following metadata are needed to rebuilt the model input
     full_tokens_list = []
