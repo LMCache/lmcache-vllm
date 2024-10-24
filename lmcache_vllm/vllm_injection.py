@@ -250,11 +250,6 @@ async def _new_tokenize_prompt_async(
     prompt = _patch_padding_space(tokenizer_id, prompt)
     # Jiayi: Patch ends here
 
-    # Jiayi: Patch starts here
-    tokenizer_id = tokenizer.tokenizer_id
-    prompt = _patch_padding_space(tokenizer_id, prompt)
-    # Jiayi: Patch ends here
-
     res = await tokenizer.encode_async(request_id=request_id,
                                         prompt=prompt,
                                         lora_request=lora_request)
