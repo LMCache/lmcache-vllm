@@ -223,12 +223,12 @@ def _new_tokenize_prompt(
     corresponding token IDs.
     """
     tokenizer = self.get_tokenizer_group()
-    
+
     # Jiayi: Patch starts here
     tokenizer_id = tokenizer.tokenizer_id
     prompt = _patch_padding_space(tokenizer_id, prompt)
     # Jiayi: Patch ends here
-    
+
     res = tokenizer.encode(request_id=request_id,
                             prompt=prompt,
                             lora_request=lora_request)
