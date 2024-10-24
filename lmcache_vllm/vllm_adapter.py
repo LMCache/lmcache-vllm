@@ -7,6 +7,7 @@ import dataclasses
 from copy import deepcopy
 from torch.nn.utils.rnn import pad_sequence
 import torch.distributed as dist
+from vllm.attention.backends.utils import compute_slot_mapping
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
@@ -14,7 +15,6 @@ if TYPE_CHECKING:
 from vllm import _custom_ops as ops
 from vllm.sequence import SequenceGroupMetadata
 from vllm.config import ModelConfig, ParallelConfig, CacheConfig
-from vllm.distributed import get_pp_group
 from vllm.utils import get_kv_cache_torch_dtype
 
 from lmcache.logging import init_logger
@@ -356,7 +356,6 @@ def lmcache_store_kv(
             current_tokens = torch.tensor(seq_data.get_token_ids()[:seq_len], device="cpu")
             vllm_block_size = cache_config.block_size
             kv_tensors_mask = ~engine.lookup(current_tokens, True)
-            from vllm.attention.backends.utils import compute_slot_mapping
             slot_mapping = []
             compute_slot_mapping(False, slot_mapping, seqid, seq_len, 
                 0, 0, vllm_block_size, seq_group_metadata.block_tables)
