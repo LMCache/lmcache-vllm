@@ -17,6 +17,7 @@ logger = init_logger(__name__)
 # TODO: need to load the special token and recompute ratio from configuration
 TEMP_SPT = torch.tensor([422, 422], dtype = torch.int, device = "cpu")
 RECOMP_RATIO = 0.15
+MINIMUM_TOKENS_TO_ENABLE_BLENDING = 256
 global_blend_retriever = None
 
 @dataclass
@@ -110,7 +111,7 @@ def should_process_request(
         return False
 
     # TODO: make this "256" be configurable
-    if len(input_ids) < 15:
+    if len(input_ids) < MINIMUM_TOKENS_TO_ENABLE_BLENDING:
         return False
 
     has_prefill = attn_metadata.prefill_metadata is not None
