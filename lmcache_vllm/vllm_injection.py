@@ -13,11 +13,14 @@ from vllm.lora.request import LoRARequest
 from vllm.worker.model_runner_base import dump_input_when_exception
 from vllm.distributed import get_pp_group
 
-from lmcache_vllm.vllm_adapter import (
+from lmcache_vllm.vllm_adapter import (lmcache_get_config,
         init_lmcache_engine, lmcache_should_store, lmcache_should_retrieve,
         lmcache_store_kv, lmcache_retrieve_kv, close_lmcache_engine,
         broadcast_seq_group_metadata, StoreStatus, RetrieveStatus,
         SUPPORTED_MODELS)
+
+from lmcache_vllm.models.llama import inject_llama
+from lmcache_vllm.attention.flash_attn import inject_flash_attn
 
 from lmcache.logging import init_logger
 logger = init_logger(__name__)
@@ -125,6 +128,15 @@ def new_execute_model(
             lmcache_store_kv(model_executable, model_input, self.cache_config,
                             kv_caches, store_status)
 
+    # CacheBlend updates
+    if lmcache_get_config().enable_blending and \
+            hasattr(model_input.attn_metadata, "blend_metadata") and \
+            model_input.attn_metadata.blend_metadata.selected_token_indices is not None:
+        new_selected_token_indices = \
+                model_input.attn_metadata.blend_metadata.selected_token_indices
+        model_input.sampling_metadata.selected_token_indices = \
+                new_selected_token_indices
+        logger.debug(f"Updating selected_token_indices to {new_selected_token_indices} after blending")
 
     # Compute the logits in the last pipeline stage.
     if not get_pp_group().is_last_rank:
@@ -312,7 +324,7 @@ def InitLMCacheEnvironment() -> None:
 
     import vllm.engine.async_llm_engine
     vllm.engine.async_llm_engine._log_task_completion = new_log_task_completion
-
+    
     import vllm.worker.model_runner
     global original_prepare_model_input
     original_prepare_model_input = vllm.worker.model_runner.ModelRunner.prepare_model_input
@@ -322,4 +334,7 @@ def InitLMCacheEnvironment() -> None:
     vllm.inputs.preprocess.InputPreprocessor._tokenize_prompt = _new_tokenize_prompt
     vllm.inputs.preprocess.InputPreprocessor._tokenize_prompt_async = _new_tokenize_prompt_async
     
-
+    # Cacheblend
+    if lmcache_get_config().enable_blending:
+        inject_llama()
+        inject_flash_attn()

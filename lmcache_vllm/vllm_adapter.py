@@ -115,6 +115,32 @@ def create_model_input_subset(
     return model_input_subset
 
 
+def lmcache_get_config() -> LMCacheEngineConfig:
+    """Get the LMCache configuration from the environment variable
+    `LMCACHE_CONFIG_FILE`. If the environment variable is not set, this
+    function will return the default configuration.
+    """
+    if hasattr(lmcache_get_config, "cached_config"):
+        return lmcache_get_config.cached_config
+
+    if "LMCACHE_CONFIG_FILE" not in os.environ:
+        logger.warn("No LMCache configuration file is set. Returning default config")
+        logger.warn("Please set the configuration file through "
+                    "the environment variable: LMCACHE_CONFIG_FILE")
+        config = LMCacheEngineConfig.from_defaults(
+                local_device = "cpu",
+                remote_url = None,
+                remote_serde = None,
+                pipelined_backend = False)
+    else:
+        config_file = os.environ["LMCACHE_CONFIG_FILE"]
+        logger.info(f"Loading LMCache config file {config_file}")
+        config = LMCacheEngineConfig.from_file(config_file)
+
+    lmcache_get_config.cached_config = config
+    return config
+
+
 def init_lmcache_engine(
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
@@ -139,20 +165,7 @@ def init_lmcache_engine(
     if LMCacheEngineBuilder.get(ENGINE_NAME) is not None:
         return 
 
-
-    if "LMCACHE_CONFIG_FILE" not in os.environ:
-        logger.warn("No LMCache configuration file is set. Returning default config")
-        logger.warn("Please set the configuration file through "
-                    "the environment variable: LMCACHE_CONFIG_FILE")
-        config = LMCacheEngineConfig.from_defaults(
-                local_device = "cpu",
-                remote_url = None,
-                remote_serde = None,
-                pipelined_backend = False)
-    else:
-        config_file = os.environ["LMCACHE_CONFIG_FILE"]
-        logger.info(f"Loading LMCache config file {config_file}")
-        config = LMCacheEngineConfig.from_file(config_file)
+    config = lmcache_get_config()
 
     # If KV cache's dtype is "auto", enforce it to be the same with model's dtype
     if cache_config.cache_dtype == "auto":
@@ -295,6 +308,16 @@ def lmcache_should_store(
              StoreStatus.PREFILL/DECODE/CHUNK_PREFILL if we should store KV after PREFILL/DECODE.
              StoreStatus.NONE if no storing is required.
     """
+
+    def is_blend_effective(attn_metadata):
+        """Check if the blend is effective for the current request
+        """
+        blend_metadata = getattr(attn_metadata, "blend_metadata", None)
+        if blend_metadata is None:
+            return False
+    
+        return blend_metadata.processed_layer_count > 0
+
     seq_lens = model_input.attn_metadata.seq_lens
     store_status = [StoreStatus.NONE] * len(seq_lens)
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
@@ -305,7 +328,11 @@ def lmcache_should_store(
 
     attn_meta = model_input.attn_metadata
     prefill_meta = attn_meta.prefill_metadata
-    
+
+    # Don't store if this request is processed by cacheblend
+    if is_blend_effective(attn_meta):
+        return store_status
+
     # TODO (yihua): Current implementation is in GPUModelRunner, so we do
     #               not need to check the type of model_runner
     #from vllm.worker.model_runner import GPUModelRunnerBase
