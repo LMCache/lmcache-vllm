@@ -62,6 +62,55 @@ SUPPORTED_MODELS = SimpleNamespace(
     qwen_family = ["Qwen/Qwen-7B"],
 )
 
+@dataclass
+class ModelInputSubset:
+    model_layers: List[nn.Module]
+    attn_layers: List[nn.Module]
+    start_layer: int
+    end_layer: int
+    
+
+def create_model_input_subset(
+    model_name: str,
+    model_executable: "ModelInputForGPUWithSamplingMetadata",
+) -> ModelInputSubset:
+    if model_name in SUPPORTED_MODELS.llama_family or \
+        model_name in SUPPORTED_MODELS.mistral_family:
+        model = model_executable.model
+        model_layers = model.layers
+        attn_layers = [layer.self_attn for layer in model_layers]
+    elif model_name in SUPPORTED_MODELS.glm_family:
+        model = model_executable.transformer
+        model_layers = model.encoder.layers
+        attn_layers = [layer.self_attention for layer in model_layers]
+    else:
+        # FIXME(Jiayi): `else` is the default setting, which could be wrong
+        model = model_executable.model
+        model_layers = model.layers
+        attn_layers = [layer.self_attn for layer in model_layers]
+    
+    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
+    # How does PP work in this case?
+    if hasattr(model, "start_layer"):
+        start_layer = model.start_layer
+    else:
+        start_layer = 0
+
+    if hasattr(model, "end_layer"):
+        end_layer = model.end_layer
+    else:
+        end_layer = len(model_layers)
+    
+    model_input_subset = ModelInputSubset(
+        model_layers=model_layers,
+        attn_layers=attn_layers,
+        start_layer=start_layer,
+        end_layer=end_layer
+    )
+    
+    return model_input_subset
+
+
 def init_lmcache_engine(
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
@@ -100,7 +149,7 @@ def init_lmcache_engine(
         config_file = os.environ["LMCACHE_CONFIG_FILE"]
         logger.info(f"Loading LMCache config file {config_file}")
         config = LMCacheEngineConfig.from_file(config_file)
-    
+
     # If KV cache's dtype is "auto", enforce it to be the same with model's dtype
     if cache_config.cache_dtype == "auto":
         kv_cache_torch_dtype = get_kv_cache_torch_dtype(cache_config.cache_dtype,
@@ -138,6 +187,7 @@ def broadcast_seq_group_metadata(
     : return: Original `model_input` if driver_worker.
               Broadcasted `model_input` otherwise.
     """
+
     # broadcast len of `seq_group_metadata_list`
     if is_driver_worker:
         seq_group_len = [len(model_input.seq_group_metadata_list)]
@@ -153,7 +203,10 @@ def broadcast_seq_group_metadata(
         seq_group_metadata_list = [None] * seq_group_len
     dist.broadcast_object_list(seq_group_metadata_list , src=0)
     
-    return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
+    if is_driver_worker:
+        return model_input
+    else:
+        return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
 
 def close_lmcache_engine() -> None:
     """Close the LMCache engine if it is initialized.
@@ -196,7 +249,6 @@ def lmcache_should_retrieve(
     # is not and should not be supported here
     # what about multuple chunk prefills in a single batch??
     
-
     # Assume all chunks are prefills
     is_all_prefill_run = ((attn_meta.num_prefills == len(seq_lens))\
         and prefill_meta is not None)
@@ -413,39 +465,16 @@ def lmcache_retrieve_kv(
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
     assert engine is not None, "LMCache engine is not initialized."
 
-    
-    # This is disagg decode instance, during prefill state
-    # Need to receive KV from the prefill instance
     query_start_loc = model_input.attn_metadata.query_start_loc
     slot_mapping = model_input.attn_metadata.slot_mapping.flatten()
     seq_lens = model_input.attn_metadata.seq_lens
 
-    if model_name in SUPPORTED_MODELS.llama_family or \
-        model_name in SUPPORTED_MODELS.mistral_family:
-        model = model_executable.model
-        model_layers = model.layers
-        attn_layers = [layer.self_attn for layer in model_layers]
-    elif model_name in SUPPORTED_MODELS.glm_family:
-        model = model_executable.transformer
-        model_layers = model.encoder.layers
-        attn_layers = [layer.self_attention for layer in model_layers]
-    else:
-        # FIXME(Jiayi): `else` is the default setting, which could be wrong
-        model = model_executable.model
-        model_layers = model.layers
-        attn_layers = [layer.self_attn for layer in model_layers]
 
-    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
-    # How does PP work in this case?
-    if hasattr(model, "start_layer"):
-        start_layer = model.start_layer
-    else:
-        start_layer = 0
-
-    if hasattr(model, "end_layer"):
-        end_layer = model.end_layer
-    else:
-        end_layer = len(kv_caches)
+    model_input_subset = create_model_input_subset(
+        model_name, model_executable)
+    attn_layers = model_input_subset.attn_layers
+    start_layer = model_input_subset.start_layer
+    end_layer = model_input_subset.end_layer
     
     # The following metadata are needed to rebuilt the model input
     full_tokens_list = []
@@ -454,13 +483,15 @@ def lmcache_retrieve_kv(
     
     start_pos_list = []
     is_prefill_list = []
-    seq_group_metadata_list = model_input.seq_group_metadata_list
+     
     next_start_pos = 0
     num_request_not_found = 0
     temp_block_table_list = []
     
     # idx is on a sequence, not a sequence group.
     idx = 0
+
+    seq_group_metadata_list = model_input.seq_group_metadata_list
 
     for seq_group_metadata in seq_group_metadata_list:
         request_id = seq_group_metadata.request_id
@@ -472,6 +503,7 @@ def lmcache_retrieve_kv(
                 total_seq_len = seq_lens[idx]
             else:
                 total_seq_len = seq_data.get_len()
+            
             full_token_tensor = torch.tensor(seq_data.get_token_ids()[:total_seq_len], device="cpu")
             full_tokens_list.append(full_token_tensor)
             

@@ -36,7 +36,7 @@ def new_execute_model(
     # TODO(Jiayi): broadcast the necessary `seq_group_metadata` in every model
     # execution. Maybe there's a more efficient way.
     model_input = broadcast_seq_group_metadata(model_input, self.is_driver_worker)
-
+    
     # LMCache retrieval
     retrieve_status = lmcache_should_retrieve(model_input, kv_caches)
     is_skip = False
@@ -91,7 +91,7 @@ def new_execute_model(
             graph_batch_size]
     else:
         model_executable = self.model
- 
+
     multi_modal_kwargs = model_input.multi_modal_kwargs or {}
     seqlen_agnostic_kwargs = {
         "finished_requests_ids": model_input.finished_requests_ids,
@@ -242,7 +242,13 @@ async def _new_tokenize_prompt_async(
     lora_request: Optional[LoRARequest],
 ) -> List[int]:
     """Async version of :meth:`_tokenize_prompt`."""
+    
     tokenizer = self.get_tokenizer_group()
+    
+    # Jiayi: Patch starts here
+    tokenizer_id = tokenizer.tokenizer_id
+    prompt = _patch_padding_space(tokenizer_id, prompt)
+    # Jiayi: Patch ends here
 
     # Jiayi: Patch starts here
     tokenizer_id = tokenizer.tokenizer_id
@@ -296,6 +302,7 @@ def wrap_prepare_model_input(
     global original_prepare_model_input
     model_input = original_prepare_model_input(
         self, seq_group_metadata_list, virtual_engine, finished_requests_ids)
+
     # NOTE(Sixian): Use seq_group_metadata_list because
     # sampling_metadata is only available
     # at the last stage of pipeline parallelism stages.
@@ -304,6 +311,7 @@ def wrap_prepare_model_input(
 def InitLMCacheEnvironment() -> None:
     """Initialize the LMCache environment.
     """
+    
     import vllm.worker.model_runner 
     vllm.worker.model_runner.ModelRunner.execute_model = new_execute_model
 
