@@ -6,6 +6,8 @@ import torch
 import dataclasses
 from copy import deepcopy
 from torch.nn.utils.rnn import pad_sequence
+from dataclasses import dataclass
+from torch import nn
 import torch.distributed as dist
 from vllm.attention.backends.utils import compute_slot_mapping
 
@@ -329,7 +331,7 @@ def lmcache_should_store(
         idx = 0
         for seq_group_idx, seq_group_metadata in enumerate(seq_group_metadata_list):
             for seqid, seq_data in seq_group_metadata.seq_data.items():
-                if seq_data.get_len()-1 != selected_token_indices[0]:
+                if seq_data.get_len()-1 != selected_token_indices[idx]:
                     # last chunk in chunk prefill
                     # or prefix already hit in retrieve
                     store_status[idx] = StoreStatus.SUFFIX_PREFILL
