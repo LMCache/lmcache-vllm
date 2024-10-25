@@ -409,14 +409,13 @@ def lmcache_store_kv(
                     continue
             current_tokens = torch.tensor(seq_data.get_token_ids()[:seq_len], device="cpu")
             vllm_block_size = cache_config.block_size
-            kv_tensors_mask = ~engine.lookup(current_tokens, True)
+            skip_leading_tokens = engine.lookup(current_tokens)
+            skip_leading_tokens = (skip_leading_tokens // engine.chunk_size) * engine.chunk_size
             slot_mapping = []
             compute_slot_mapping(False, slot_mapping, seqid, seq_len, 
-                0, 0, vllm_block_size, seq_group_metadata.block_tables)
-            current_slot_mapping_tensor = torch.tensor(slot_mapping, device="cpu")
-            current_slot_mapping_tensor = current_slot_mapping_tensor[kv_tensors_mask]
+                skip_leading_tokens, 0, vllm_block_size, seq_group_metadata.block_tables)
             kv_tuple_list = []
-            if len(current_slot_mapping_tensor) > 0:
+            if len(slot_mapping) > 0:
                 for layer_id in range(start_layer, end_layer):
                     kv_cache = kv_caches[layer_id - start_layer]
 
@@ -426,13 +425,15 @@ def lmcache_store_kv(
                     value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
                     
                     kv_tuple_list.append(
-                            (key_cache[current_slot_mapping_tensor],
-                            value_cache[current_slot_mapping_tensor])
+                            (key_cache[slot_mapping],
+                            value_cache[slot_mapping])
                         )
 
-                stored_token_num = len(current_slot_mapping_tensor)
+                stored_token_num = len(slot_mapping)
                 skipped_token_num = seq_len - stored_token_num
                 logger.debug(f"Store skips {skipped_token_num} tokens and then stores {stored_token_num} tokens")
+                kv_tensors_mask = torch.ones_like(current_tokens, dtype=torch.bool)
+                kv_tensors_mask[:skipped_token_num] = False
                 engine.store(current_tokens.cpu(), tuple(kv_tuple_list), kv_tensors_mask,
                             skip_existing = True, blocking = False)
             
