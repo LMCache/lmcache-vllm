@@ -410,33 +410,38 @@ def lmcache_store_kv(
             current_tokens = torch.tensor(seq_data.get_token_ids()[:seq_len], device="cpu")
             vllm_block_size = cache_config.block_size
             skip_leading_tokens = engine.lookup(current_tokens)
-            skip_leading_tokens = (skip_leading_tokens // engine.chunk_size) * engine.chunk_size
-            slot_mapping = []
-            compute_slot_mapping(False, slot_mapping, seqid, seq_len, 
-                skip_leading_tokens, 0, vllm_block_size, seq_group_metadata.block_tables)
-            kv_tuple_list = []
-            if len(slot_mapping) > 0:
-                for layer_id in range(start_layer, end_layer):
-                    kv_cache = kv_caches[layer_id - start_layer]
+            assert skip_leading_tokens <= seq_len
+            if skip_leading_tokens < seq_len:
+                assert skip_leading_tokens % engine.chunk_size == 0
+                slot_mapping = []
+                compute_slot_mapping(False, slot_mapping, seqid, seq_len, 
+                    skip_leading_tokens, 0, vllm_block_size, seq_group_metadata.block_tables)
+                kv_tuple_list = []
+                if len(slot_mapping) > 0:
+                    for layer_id in range(start_layer, end_layer):
+                        kv_cache = kv_caches[layer_id - start_layer]
 
-                    _, _, num_heads, head_size = kv_cache[0].shape
+                        _, _, num_heads, head_size = kv_cache[0].shape
 
-                    key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
-                    value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
-                    
-                    kv_tuple_list.append(
-                            (key_cache[slot_mapping],
-                            value_cache[slot_mapping])
-                        )
+                        key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
+                        value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
+                        
+                        kv_tuple_list.append(
+                                (key_cache[slot_mapping],
+                                value_cache[slot_mapping])
+                            )
 
-                stored_token_num = len(slot_mapping)
-                skipped_token_num = seq_len - stored_token_num
-                logger.debug(f"Store skips {skipped_token_num} tokens and then stores {stored_token_num} tokens")
-                kv_tensors_mask = torch.ones_like(current_tokens, dtype=torch.bool)
-                kv_tensors_mask[:skipped_token_num] = False
-                engine.store(current_tokens.cpu(), tuple(kv_tuple_list), kv_tensors_mask,
-                            skip_existing = True, blocking = False)
-            
+                    stored_token_num = len(slot_mapping)
+                    skipped_token_num = seq_len - stored_token_num
+                    kv_tensors_mask = torch.ones_like(current_tokens, dtype=torch.bool)
+                    kv_tensors_mask[:skipped_token_num] = False
+                    engine.store(current_tokens.cpu(), tuple(kv_tuple_list), kv_tensors_mask,
+                                skip_existing = True, blocking = False)
+            else:
+                stored_token_num = 0
+                skipped_token_num = seq_len
+            logger.debug(f"Store skips {skipped_token_num} tokens "\
+                    f"and then stores {stored_token_num} tokens")
             seq_data_idx += 1
 
 @_lmcache_nvtx_annotate
