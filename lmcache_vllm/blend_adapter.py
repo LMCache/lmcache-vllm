@@ -1,5 +1,5 @@
 import torch
-from typing import Tuple, List
+from typing import Tuple, List, Optional, Dict, Any
 from dataclasses import dataclass
 
 from lmcache.cache_engine import LMCacheEngineBuilder
@@ -19,6 +19,7 @@ TEMP_SPT = torch.tensor([422, 422], dtype = torch.int, device = "cpu")
 RECOMP_RATIO = 0.15
 MINIMUM_TOKENS_TO_ENABLE_BLENDING = 256
 global_blend_retriever = None
+g_manually_disabled = False
 
 @dataclass
 class BlendMetadata:
@@ -43,12 +44,15 @@ class BlendMetadata:
         request
     :ivar torch.Tensor selected_token_indices: will be used to update the 
         sampling_metadata after model.forward
+    :ivar torch.Tensor original_query_start_loc: The original query start
+        loc array before selecting the tokens
     """
     processed_layer_count: int
     positions: torch.Tensor
     retrieval_task: BlendRetrieverTask
     blend_executor: BlendExecutor
     selected_token_indices: torch.Tensor
+    original_query_start_loc: torch.Tensor
 
 def convert_retrieved_kv_shape(k_or_v: torch.Tensor) -> torch.Tensor:
     """Convert the retrieved KV layer shape to [num_tokens, hidden_dims]
@@ -58,7 +62,7 @@ def convert_retrieved_kv_shape(k_or_v: torch.Tensor) -> torch.Tensor:
     nt, nh, hs = tmp.shape
     return tmp.reshape((nt, nh * hs))
 
-def pre_initialize():
+def init_cacheblend_retriever():
     cache_engine = LMCacheEngineBuilder.get(ENGINE_NAME)
 
     if cache_engine is None:
@@ -68,6 +72,7 @@ def pre_initialize():
     # FIXME: we are trying to read metadata from cache_engine, which breaks the encapsulation
     global global_blend_retriever 
     global_blend_retriever = SPTBlendRetriever(TEMP_SPT, cache_engine, cache_engine.metadata)
+
 
 
 # MAIN FUNCTIONS
@@ -101,11 +106,21 @@ def append_separator(
     separator = " # #"
     return input_prompt + separator
 
+def disable_blend():
+    global g_manually_disabled
+    g_manually_disabled = True
+
+
+
 def should_process_request(
         input_ids: torch.Tensor,
         attn_metadata: AttentionMetadata,
         kv_caches: List[torch.Tensor],
     ) -> bool:
+    # Check if we manually disabled it
+    if g_manually_disabled:
+        return False
+
     is_profile_run = (kv_caches is None) or (kv_caches[0] is None)
     if is_profile_run:
         return False
@@ -140,10 +155,11 @@ def process_new_request(
 
     global global_blend_retriever
     if global_blend_retriever is None:
-        pre_initialize()
+        init_cacheblend_retriever()
     task = global_blend_retriever.new_request(input_ids.cpu(), attn_metadata.query_start_loc)
+
     executor = CacheBlendImpl(RECOMP_RATIO)
-    blend_metadata = BlendMetadata(0, positions, task, executor, None)
+    blend_metadata = BlendMetadata(0, positions, task, executor, None, None)
     setattr(attn_metadata, "blend_metadata", blend_metadata)
     return attn_metadata
 
@@ -152,7 +168,9 @@ def do_blend(
         fresh_q: torch.Tensor,
         fresh_k: torch.Tensor,
         fresh_v: torch.Tensor,
-        attn_metadata: AttentionMetadata
+        attn_metadata: AttentionMetadata,
+        rotary_emb,
+        reverse_rotary_emb,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, AttentionMetadata]:
     """Do the cache blending with following steps:
     1. retrieve the KV
@@ -167,6 +185,10 @@ def do_blend(
         # Do nothing
         return fresh_q, fresh_k, fresh_v, attn_metadata
 
+    # Store original query start loc
+    if blend_metadata.original_query_start_loc is None:
+        blend_metadata.original_query_start_loc = attn_metadata.query_start_loc.clone()
+
     # Retrieve the KV
     layer_id = blend_metadata.processed_layer_count
     retrieved_kv = blend_metadata.retrieval_task.result(layer_id)
@@ -177,16 +199,19 @@ def do_blend(
     # blend the KV
     rk = convert_retrieved_kv_shape(retrieved_kv.k)
     rv = convert_retrieved_kv_shape(retrieved_kv.v)
+    blend_metadata.blend_executor.set_positional_encoder(rotary_emb)
+    blend_metadata.blend_executor.set_reverse_positional_encoder(reverse_rotary_emb)
     blender_output = blend_metadata.blend_executor.blend(
             layer_id,
             rk,
             rv,
             retrieved_kv.valid_mask,
+            retrieved_kv.original_positions,
             fresh_q,
             fresh_k,
             fresh_v,
             blend_metadata.positions,
-            attn_metadata.query_start_loc,
+            blend_metadata.original_query_start_loc,
             0)
 
     # Update blend_metadata
@@ -207,6 +232,7 @@ def do_blend(
         # Block tables is for the prefix KV, won't change
 
         # query_start_loc 
+        assert blender_output.query_start_loc is not None
         attn_metadata.query_start_loc = blender_output.query_start_loc
 
         # context lens: won't change
@@ -214,5 +240,8 @@ def do_blend(
         # selected_token_indices:
         new_selected_token_indices = blender_output.query_start_loc[1:].clone() - 1
         attn_metadata.blend_metadata.selected_token_indices = new_selected_token_indices
+    else:
+        # Shouldn't change query_start_loc if token selection does not happen
+        assert blender_output.query_start_loc is None
 
     return blender_output.q, blender_output.k, blender_output.v, attn_metadata
