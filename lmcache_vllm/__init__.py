@@ -8,19 +8,20 @@ import lmcache_vllm.blend_adapter as blend_adapter
 from lmcache.logging import init_logger
 logger = init_logger(__name__)
 
-EXPECTED_VLLM_VERSION = "0.6.1.post2"
-__version__ = "0.6.2.1"
+EXPECTED_VLLM_VERSIONS = ["0.6.1.post2", "0.6.1.dev238+ge2c6e0a82"]
+__version__ = "0.6.2.2"
 
-def check_library_version(library_name, required_version):
+
+def check_library_version(library_name, required_versions):
     try:
         # Dynamically import the specified library
         lib = importlib.import_module(library_name)
         # Check if the installed version matches the required version
         if hasattr(lib, '__version__'):
-            if lib.__version__ == required_version:
+            if lib.__version__ in required_versions:
                 return True
             else:
-                logger.error(f"Version mismatch: {lib.__version__} found, {required_version} required.")
+                logger.error(f"Version mismatch: {lib.__version__} found, {required_versions} required.")
                 return False
         else:
             logger.error(f"The library {library_name} does not have a '__version__' attribute.")
@@ -31,8 +32,8 @@ def check_library_version(library_name, required_version):
 
 def initialize_environment():
     # Check vllm and it's version
-    logger.info(f"Initializing lmcache_vllm version {__version__} for vllm {EXPECTED_VLLM_VERSION}")
-    assert check_library_version("vllm", EXPECTED_VLLM_VERSION), f"vllm {EXPECTED_VLLM_VERSION} not found"
+    logger.info(f"Initializing lmcache_vllm version {__version__}, supporting vllm versions: {EXPECTED_VLLM_VERSIONS}")
+    assert check_library_version("vllm", EXPECTED_VLLM_VERSIONS), f"vllm {EXPECTED_VLLM_VERSIONS} not found"
     InitLMCacheEnvironment()
 
 initialize_environment()

@@ -1,5 +1,5 @@
 """
-This version works with vllm-0.6.1.post2
+This version works with vllm-0.6.1.post2 and 0.6.2
 """
 from functools import wraps
 import torch
