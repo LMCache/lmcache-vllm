@@ -10,12 +10,27 @@ from lmcache.logging import init_logger
 
 from vllm.attention import AttentionMetadata
 
-from lmcache_vllm.vllm_adapter import ENGINE_NAME
+from lmcache_vllm.lmcache_utils import ENGINE_NAME
 
 logger = init_logger(__name__)
 
+class ReqId2Indices:
+    def __init__(self):
+        self._map_dict = {}
+    def add_request(self, request_id, indices):
+        assert request_id not in self._map_dict
+        self._map_dict[request_id] = indices
+    def get_request(self, request_id):
+        assert request_id in self._map_dict
+        return self._map_dict[request_id]
+    def delete_request(self, request_id):
+        assert request_id in self._map_dict
+        del self._map_dict[request_id]
+    
+global_req_id2indices = ReqId2Indices()
+
 # TODO: need to load the special token and recompute ratio from configuration
-TEMP_SPT = torch.tensor([422, 422], dtype = torch.int, device = "cpu")
+TEMP_SPT = [422, 422]
 RECOMP_RATIO = 0.15
 MINIMUM_TOKENS_TO_ENABLE_BLENDING = 256
 global_blend_retriever = None
@@ -76,6 +91,24 @@ def init_cacheblend_retriever():
 
 
 # MAIN FUNCTIONS
+
+def drop_blend_spt(request_id, prompt: List[int]) -> List[int]:
+    if global_blend_retriever is None:
+        init_cacheblend_retriever()
+    new_prompt, indices = global_blend_retriever.drop_spt_and_get_indices(prompt)
+    global_req_id2indices.add_request(request_id, indices)
+    return new_prompt
+
+def get_blend_indices(request_id, len_of_prompt: int) -> List[int]:
+    # NOTE: Always adjust the last index to the end of the request.
+    indices = global_req_id2indices.get_request(request_id)
+    indices[-1] = len_of_prompt
+    return indices
+
+# TODO: When to remove the indices, should remove when sequence group is removed.
+
+def remove_request_id_indices(request_id):
+    global_req_id2indices.delete_request(request_id)
 
 def combine_input_prompt_chunks(
         prompt_chunks: List[str],
@@ -156,7 +189,13 @@ def process_new_request(
     global global_blend_retriever
     if global_blend_retriever is None:
         init_cacheblend_retriever()
-    task = global_blend_retriever.new_request(input_ids.cpu(), attn_metadata.query_start_loc)
+    prompt_list = []
+    indices_list = []
+    blend_prompt_indices = attn_metadata.blend_prompt_indices
+    for tp in blend_prompt_indices:
+        prompt_list.append(tp[0])
+        indices_list.append(tp[1])
+    task = global_blend_retriever.new_request(prompt_list, indices_list)
 
     executor = CacheBlendImpl(RECOMP_RATIO)
     blend_metadata = BlendMetadata(0, positions, task, executor, None, None)

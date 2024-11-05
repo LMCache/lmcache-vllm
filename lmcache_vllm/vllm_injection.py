@@ -16,8 +16,9 @@ from vllm.distributed import get_pp_group
 from lmcache_vllm.vllm_adapter import (lmcache_get_config,
         init_lmcache_engine, lmcache_should_store, lmcache_should_retrieve,
         lmcache_store_kv, lmcache_retrieve_kv, close_lmcache_engine,
-        broadcast_seq_group_metadata, StoreStatus, RetrieveStatus,
+        broadcast_seq_group_metadata, lmcache_blend_drop_spt, StoreStatus, RetrieveStatus,
         SUPPORTED_MODELS)
+from lmcache_vllm.blend_adapter import get_blend_indices, remove_request_id_indices
 
 from lmcache_vllm.models.llama import inject_llama
 from lmcache_vllm.attention.flash_attn import inject_flash_attn
@@ -244,7 +245,7 @@ def _new_tokenize_prompt(
                             prompt=prompt,
                             lora_request=lora_request)
     
-    return res
+    return lmcache_blend_drop_spt(request_id, res)
 
 async def _new_tokenize_prompt_async(
     self,
@@ -265,7 +266,7 @@ async def _new_tokenize_prompt_async(
                                         prompt=prompt,
                                         lora_request=lora_request)
     
-    return res
+    return lmcache_blend_drop_spt(request_id, res)
 
 def new_log_task_completion(task: asyncio.Task,
                             error_callback) -> None:
@@ -314,6 +315,42 @@ def wrap_prepare_model_input(
     # at the last stage of pipeline parallelism stages.
     return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
 
+original_prepare_model_input_tensors = None
+def wrap_prepare_model_input_tensors(
+        self,
+        seq_group_metadata_list,
+        finished_requests_ids: Optional[List[str]] = None
+    ):
+    model_input = original_prepare_model_input_tensors(self,
+        seq_group_metadata_list, finished_requests_ids)
+    attn_metadata = model_input.attn_metadata
+    if attn_metadata is not None:
+        if lmcache_get_config().enable_blending:
+            assert not hasattr(attn_metadata, "blend_prompt_indices")
+            setattr(attn_metadata, "blend_prompt_indices", [])
+            seq_lens = attn_metadata.seq_lens
+            seq_data_idx = 0
+            for seq_group_metadata in seq_group_metadata_list:
+                for seqid, seq_data in seq_group_metadata.seq_data.items():
+                    seq_len = seq_lens[seq_data_idx]
+                    if seq_group_metadata.block_tables is not None:
+                        indices = get_blend_indices(seq_group_metadata.request_id, seq_len)
+                    else:
+                        indices = [0, seq_len]
+                    attn_metadata.blend_prompt_indices.append((torch.tensor(
+                        seq_data.get_token_ids()[:seq_len], device="cpu"), indices))
+                    seq_data_idx += 1
+            assert seq_data_idx == len(seq_lens)
+    return model_input
+
+def new_free_finished_seqs(self, seq_group) -> None:
+    """Free finished seqs in a sequence group."""
+    for seq in seq_group.get_seqs():
+        if seq.is_finished():
+            self.free_seq(seq)
+    if seq_group.is_finished():
+        remove_request_id_indices(seq_group.request_id)
+
 def InitLMCacheEnvironment() -> None:
     """Initialize the LMCache environment.
     """
@@ -328,6 +365,13 @@ def InitLMCacheEnvironment() -> None:
     global original_prepare_model_input
     original_prepare_model_input = vllm.worker.model_runner.ModelRunner.prepare_model_input
     vllm.worker.model_runner.ModelRunner.prepare_model_input = wrap_prepare_model_input
+
+    global original_prepare_model_input_tensors
+    original_prepare_model_input_tensors = vllm.worker.model_runner.ModelRunner._prepare_model_input_tensors
+    vllm.worker.model_runner.ModelRunner._prepare_model_input_tensors = wrap_prepare_model_input_tensors
+
+    import vllm.core.scheduler
+    vllm.core.scheduler.Scheduler._free_finished_seqs = new_free_finished_seqs
     
     import vllm
     vllm.inputs.preprocess.InputPreprocessor._tokenize_prompt = _new_tokenize_prompt
