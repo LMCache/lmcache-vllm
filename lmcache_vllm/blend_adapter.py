@@ -105,7 +105,6 @@ def get_blend_indices(request_id, len_of_prompt: int) -> List[int]:
     indices[-1] = len_of_prompt
     return indices
 
-# TODO: When to remove the indices, should remove when sequence group is removed.
 
 def remove_request_id_indices(request_id):
     global_req_id2indices.delete_request(request_id)
@@ -195,7 +194,7 @@ def process_new_request(
     for tp in blend_prompt_indices:
         prompt_list.append(tp[0])
         indices_list.append(tp[1])
-    task = global_blend_retriever.new_request(prompt_list, indices_list)
+    task = global_blend_retriever.segmented_new_request(prompt_list, indices_list)
 
     executor = CacheBlendImpl(RECOMP_RATIO)
     blend_metadata = BlendMetadata(0, positions, task, executor, None, None)
