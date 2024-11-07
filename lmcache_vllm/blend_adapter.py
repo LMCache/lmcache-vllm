@@ -30,7 +30,7 @@ class ReqId2Indices:
 global_req_id2indices = ReqId2Indices()
 
 # TODO: need to load the special token and recompute ratio from configuration
-TEMP_SPT = torch.tensor([422, 422], dtype = torch.int, device = "cpu")
+TEMP_SPT = [422, 422]
 RECOMP_RATIO = 0.15
 MINIMUM_TOKENS_TO_ENABLE_BLENDING = 256
 global_blend_retriever = None
@@ -194,7 +194,7 @@ def process_new_request(
     for tp in blend_prompt_indices:
         prompt_list.append(tp[0])
         indices_list.append(tp[1])
-    task = global_blend_retriever.segmented_new_request(prompt_list, indices_list)
+    task = global_blend_retriever.new_request(prompt_list, indices_list)
 
     executor = CacheBlendImpl(RECOMP_RATIO)
     blend_metadata = BlendMetadata(0, positions, task, executor, None, None)
