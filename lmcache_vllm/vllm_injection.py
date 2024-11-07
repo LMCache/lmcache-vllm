@@ -18,7 +18,7 @@ from lmcache_vllm.vllm_adapter import (lmcache_get_config,
         lmcache_store_kv, lmcache_retrieve_kv, close_lmcache_engine,
         broadcast_seq_group_metadata, lmcache_blend_drop_spt, StoreStatus, RetrieveStatus,
         SUPPORTED_MODELS)
-from lmcache_vllm.blend_adapter import get_blend_indices, remove_request_id_indices
+from lmcache_vllm.blend_adapter import attach_blend_prompt_indices, remove_request_id_indices
 
 from lmcache_vllm.models.llama import inject_llama
 from lmcache_vllm.attention.flash_attn import inject_flash_attn
@@ -326,21 +326,7 @@ def wrap_prepare_model_input_tensors(
     attn_metadata = model_input.attn_metadata
     if attn_metadata is not None:
         if lmcache_get_config().enable_blending:
-            assert not hasattr(attn_metadata, "blend_prompt_indices")
-            setattr(attn_metadata, "blend_prompt_indices", [])
-            seq_lens = attn_metadata.seq_lens
-            seq_data_idx = 0
-            for seq_group_metadata in seq_group_metadata_list:
-                for seqid, seq_data in seq_group_metadata.seq_data.items():
-                    seq_len = seq_lens[seq_data_idx]
-                    if seq_group_metadata.block_tables is not None:
-                        indices = get_blend_indices(seq_group_metadata.request_id, seq_len)
-                    else:
-                        indices = [0, seq_len]
-                    attn_metadata.blend_prompt_indices.append((torch.tensor(
-                        seq_data.get_token_ids()[:seq_len], device="cpu"), indices))
-                    seq_data_idx += 1
-            assert seq_data_idx == len(seq_lens)
+            attach_blend_prompt_indices(seq_group_metadata_list, attn_metadata)
     return model_input
 
 def new_free_finished_seqs(self, seq_group) -> None:
