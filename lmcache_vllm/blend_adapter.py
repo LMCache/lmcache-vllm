@@ -31,8 +31,6 @@ global_req_id2indices = ReqId2Indices()
 
 # TODO: need to load the special token and recompute ratio from configuration
 TEMP_SPT = [422, 422]
-RECOMP_RATIO = 0.15
-MINIMUM_TOKENS_TO_ENABLE_BLENDING = 256
 global_blend_retriever = None
 g_manually_disabled = False
 
@@ -159,7 +157,8 @@ def should_process_request(
     if is_profile_run:
         return False
 
-    # TODO: make this "256" be configurable
+    cache_engine = LMCacheEngineBuilder.get(ENGINE_NAME)
+    MINIMUM_TOKENS_TO_ENABLE_BLENDING = cache_engine.config.blend_min_tokens
     if len(input_ids) < MINIMUM_TOKENS_TO_ENABLE_BLENDING:
         return False
 
@@ -197,6 +196,7 @@ def process_new_request(
         attn_metadata.blend_metadata.request_prompt_list, 
         attn_metadata.blend_metadata.prompt_indices_list
     )
+    RECOMP_RATIO = cache_engine.config.blend_recompute_ratio
     executor = CacheBlendImpl(RECOMP_RATIO)
     attn_metadata.blend_metadata.positions = positions
     attn_metadata.blend_metadata.retrieval_task = task
