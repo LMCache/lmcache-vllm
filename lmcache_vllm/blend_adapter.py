@@ -105,7 +105,6 @@ def get_blend_indices(request_id, len_of_prompt: int) -> List[int]:
     indices[-1] = len_of_prompt
     return indices
 
-
 def remove_request_id_indices(request_id):
     global_req_id2indices.delete_request(request_id)
 
