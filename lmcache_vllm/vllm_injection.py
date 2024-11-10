@@ -6,7 +6,8 @@ import torch
 import os
 import asyncio
 import dataclasses
-from typing import Optional, List
+from dataclasses import fields
+from typing import Optional, List, Set, Dict, Any
 
 from vllm.multimodal import MultiModalInputs
 from vllm.lora.request import LoRARequest
@@ -23,6 +24,7 @@ from lmcache_vllm.blend_adapter import attach_blend_prompt_indices
 
 from lmcache_vllm.models.llama import inject_llama
 from lmcache_vllm.attention.flash_attn import inject_flash_attn
+import vllm.worker.model_runner_base
 
 from lmcache.logging import init_logger
 logger = init_logger(__name__)
@@ -338,6 +340,52 @@ def new_free_finished_seqs(self, seq_group) -> None:
     if seq_group.is_finished():
         lmcache_remove_request_id_indices(seq_group.request_id)
 
+
+def new_asdict_zerocopy(self,
+                        skip_fields: Optional[Set[str]] = None
+                        ) -> Dict[str, Any]:
+        """Similar to dataclasses.asdict, but avoids deepcopying."""
+        if skip_fields is None:
+            skip_fields = set()
+        # Note that if we add dataclasses as fields, they will need
+        # similar handling.
+        result = {
+            field.name: getattr(self, field.name)
+            for field in fields(self) if field.name not in skip_fields
+        }
+        if hasattr(self, "blend_metadata"):
+            result["blend_metadata"] = self.blend_metadata
+        return result
+
+
+@classmethod
+def new_from_broadcasted_tensor_dict_with_sampling(
+        cls,
+        tensor_dict: Dict[str, Any],
+        attn_backend: Optional["AttentionBackend"] = None,
+    ) -> "ModelInputForGPUWithSamplingMetadata":
+        from vllm.worker.model_runner_base import _init_sampling_metadata_from_tensor_dict, _init_attn_metadata_from_tensor_dict
+        tensor_dict = _init_sampling_metadata_from_tensor_dict(tensor_dict)
+        if attn_backend is not None:
+            tensor_dict = _init_attn_metadata_from_tensor_dict(
+                attn_backend, tensor_dict)
+        if "blend_metadata" in tensor_dict:
+            assert "attn_metadata" in tensor_dict
+            setattr(tensor_dict["attn_metadata"], "blend_metadata", tensor_dict["blend_metadata"])
+            tensor_dict.pop("blend_metadata")
+
+        return cls(**tensor_dict)
+
+
+
+def inject_blend():
+    import vllm.attention.backends.abstract
+    vllm.attention.backends.abstract.AttentionMetadata.asdict_zerocopy = new_asdict_zerocopy
+
+    import vllm.worker.model_runner
+    vllm.worker.model_runner.ModelInputForGPUWithSamplingMetadata.from_broadcasted_tensor_dict = \
+    new_from_broadcasted_tensor_dict_with_sampling
+
 def InitLMCacheEnvironment() -> None:
     """Initialize the LMCache environment.
     """
@@ -368,3 +416,4 @@ def InitLMCacheEnvironment() -> None:
     if lmcache_get_config().enable_blending:
         inject_llama()
         inject_flash_attn()
+        inject_blend()
