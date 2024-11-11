@@ -9,6 +9,7 @@ import dataclasses
 from dataclasses import fields
 from typing import Optional, List, Set, Dict, Any
 
+import vllm.entrypoints.openai.serving_engine
 from vllm.multimodal import MultiModalInputs
 from vllm.lora.request import LoRARequest
 from vllm.worker.model_runner_base import dump_input_when_exception
@@ -244,11 +245,10 @@ def _new_tokenize_prompt(
     prompt = _patch_padding_space(tokenizer_id, prompt)
     # Jiayi: Patch ends here
 
-    res = tokenizer.encode(request_id=request_id,
+    return tokenizer.encode(request_id=request_id,
                             prompt=prompt,
                             lora_request=lora_request)
     
-    return lmcache_blend_drop_spt(request_id, res)
 
 async def _new_tokenize_prompt_async(
     self,
@@ -265,11 +265,10 @@ async def _new_tokenize_prompt_async(
     prompt = _patch_padding_space(tokenizer_id, prompt)
     # Jiayi: Patch ends here
 
-    res = await tokenizer.encode_async(request_id=request_id,
+    return await tokenizer.encode_async(request_id=request_id,
                                         prompt=prompt,
                                         lora_request=lora_request)
     
-    return lmcache_blend_drop_spt(request_id, res)
 
 def new_log_task_completion(task: asyncio.Task,
                             error_callback) -> None:
@@ -377,6 +376,70 @@ def new_from_broadcasted_tensor_dict_with_sampling(
         return cls(**tensor_dict)
 
 
+original_extract_prompt_components = None
+original_extract_prompt_components_async = None
+
+def new_extract_prompt_components(self,
+                                  inputs,
+                                  request_id,
+                                  lora_request = None):
+    prompt, prompt_token_ids, multi_modal_data = original_extract_prompt_components(self, inputs, request_id, lora_request)
+    prompt_token_ids = lmcache_blend_drop_spt(request_id, prompt_token_ids)
+    return prompt, prompt_token_ids, multi_modal_data
+
+async def new_extract_prompt_components_async(
+        self,
+        inputs,
+        request_id,
+        lora_request = None,
+    ):
+    prompt, prompt_token_ids, multi_modal_data = await original_extract_prompt_components_async(
+        self, inputs, request_id, lora_request)
+    prompt_token_ids = lmcache_blend_drop_spt(request_id, prompt_token_ids)
+    return prompt, prompt_token_ids, multi_modal_data
+
+original_llm_engine_init = None
+from vllm.inputs import INPUT_REGISTRY, InputRegistry
+from vllm.usage.usage_lib import UsageContext
+def new_llm_engine_init(
+        self,
+        model_config,
+        cache_config,
+        parallel_config,
+        scheduler_config,
+        device_config,
+        load_config,
+        lora_config,
+        speculative_config,
+        decoding_config,
+        observability_config,
+        prompt_adapter_config,
+        executor_class,
+        log_stats: bool,
+        usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
+        stat_loggers = None,
+        input_registry: InputRegistry = INPUT_REGISTRY,
+        use_cached_outputs: bool = False,
+    ) -> None:
+    original_llm_engine_init(self,
+                             model_config,
+                             cache_config,
+                             parallel_config,
+                             scheduler_config,
+                             device_config,
+                             load_config,
+                             lora_config,
+                             speculative_config,
+                             decoding_config,
+                             observability_config,
+                             prompt_adapter_config,
+                             executor_class,
+                             log_stats,
+                             usage_context,
+                             stat_loggers,
+                             input_registry,
+                             use_cached_outputs)
+    init_lmcache_engine(model_config, parallel_config, cache_config)
 
 def inject_blend():
     import vllm.attention.backends.abstract
@@ -386,9 +449,22 @@ def inject_blend():
     vllm.worker.model_runner.ModelInputForGPUWithSamplingMetadata.from_broadcasted_tensor_dict = \
     new_from_broadcasted_tensor_dict_with_sampling
 
+    import vllm.inputs.preprocess
+    global original_extract_prompt_components
+    global original_extract_prompt_components_async
+    original_extract_prompt_components = vllm.inputs.preprocess.InputPreprocessor._extract_prompt_components
+    original_extract_prompt_components_async = vllm.inputs.preprocess.InputPreprocessor._extract_prompt_components_async
+    vllm.inputs.preprocess.InputPreprocessor._extract_prompt_components = new_extract_prompt_components
+    vllm.inputs.preprocess.InputPreprocessor._extract_prompt_components_async = new_extract_prompt_components_async
+
+
 def InitLMCacheEnvironment() -> None:
     """Initialize the LMCache environment.
     """
+    import vllm.engine.llm_engine
+    global original_llm_engine_init
+    original_llm_engine_init = vllm.engine.llm_engine.LLMEngine.__init__
+    vllm.engine.llm_engine.LLMEngine.__init__ = new_llm_engine_init
     
     import vllm.worker.model_runner 
     vllm.worker.model_runner.ModelRunner.execute_model = new_execute_model

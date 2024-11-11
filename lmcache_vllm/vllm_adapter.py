@@ -141,10 +141,8 @@ def lmcache_get_config() -> LMCacheEngineConfig:
 
 def lmcache_blend_drop_spt(request_id, prompt: List[int]) -> List[int]:
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
-    if engine is None:
-        return prompt
-    if not engine.config.enable_blending:
-        return prompt
+    assert engine is not None
+    assert engine.config.enable_blending
     return drop_blend_spt(request_id, prompt)
 
 def lmcache_remove_request_id_indices(request_id):
