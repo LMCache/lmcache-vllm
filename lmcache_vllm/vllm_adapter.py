@@ -30,18 +30,6 @@ logger = init_logger(__name__)
 ENGINE_NAME = "vllm-instance"
 LMCACHE_CUDA_STREAM = torch.cuda.Stream()
 
-# FIXME(Jiayi): Not sure if this is needed
-STR_DTYPE_TO_TORCH_DTYPE = {
-    "half": torch.half,
-    "bfloat16": torch.bfloat16,
-    "float": torch.float,
-    "float32": torch.float32,
-    "float64": torch.float64,
-    "double": torch.double,
-    "fp8": torch.uint8,
-    "fp8_e4m3": torch.float8_e4m3fn,
-    "fp8_e5m2": torch.float8_e5m2,
-}
 class StoreStatus(Enum):
     PREFILL = 1
     CHUNK_PREFILL = 2
