@@ -1,15 +1,12 @@
 """
 This version works with vllm-0.6.1.post2 and 0.6.2
 """
-from functools import wraps
 import torch
-import os
 import asyncio
 import dataclasses
 from dataclasses import fields
 from typing import Optional, List, Set, Dict, Any
 
-import vllm.entrypoints.openai.serving_engine
 from vllm.multimodal import MultiModalInputs
 from vllm.lora.request import LoRARequest
 from vllm.worker.model_runner_base import dump_input_when_exception
@@ -25,7 +22,6 @@ from lmcache_vllm.blend_adapter import attach_blend_prompt_indices
 
 from lmcache_vllm.models.llama import inject_llama
 from lmcache_vllm.attention.flash_attn import inject_flash_attn
-import vllm.worker.model_runner_base
 
 from lmcache.logging import init_logger
 logger = init_logger(__name__)

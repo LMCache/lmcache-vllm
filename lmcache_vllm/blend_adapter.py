@@ -14,22 +14,21 @@ from lmcache_vllm.lmcache_utils import ENGINE_NAME
 
 logger = init_logger(__name__)
 
+# NOTE: With openai apiserver, it is possible to 
+# have duplicated request_id if very unlucky.
 class ReqId2Indices:
     def __init__(self):
         self._map_dict = {}
     def add_request(self, request_id, indices):
-        assert request_id not in self._map_dict
         self._map_dict[request_id] = indices
     def get_request(self, request_id):
-        assert request_id in self._map_dict
-        return self._map_dict[request_id]
+        return self._map_dict.get(request_id, None)
     def delete_request(self, request_id):
-        assert request_id in self._map_dict
-        del self._map_dict[request_id]
+        self._map_dict.pop(request_id, None)
     
 global_req_id2indices = ReqId2Indices()
 
-# TODO: need to load the special token and recompute ratio from configuration
+# TODO: Special token text and token_id should depend on models.
 TEMP_SPT = [422, 422]
 global_blend_retriever = None
 g_manually_disabled = False
@@ -102,8 +101,18 @@ def drop_blend_spt(request_id, prompt: List[int]) -> List[int]:
 def get_blend_indices(request_id, len_of_prompt: int) -> List[int]:
     # NOTE: Always adjust the last index to the end of the request.
     indices = global_req_id2indices.get_request(request_id)
-    indices[-1] = len_of_prompt
-    return indices
+    if indices is None:
+        logger.warning("indices is None, possible due to duplicated request_id")
+        return [0, len_of_prompt]
+    assert len(indices) >= 2
+    assert indices[0] == 0
+    if indices[-1] > len_of_prompt:
+        # Only possible when duplicated request_id, resulting in wrong indices.
+        logger.warning("indices not matching prompt length, possible due to duplicated request_id")
+        return [0, len_of_prompt]
+    else:
+        indices[-1] = len_of_prompt
+        return indices
 
 def remove_request_id_indices(request_id):
     global_req_id2indices.delete_request(request_id)
