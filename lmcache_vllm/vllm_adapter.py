@@ -176,6 +176,8 @@ def init_lmcache_engine(
     head_size = model_config.get_head_size()
     kv_shape = (num_layer, 2, chunk_size, num_kv_head, head_size)
     
+    # Change current device.
+    torch.cuda.device(parallel_config.rank)
     metadata = LMCacheEngineMetadata(
             model_config.model,
             parallel_config.world_size,
