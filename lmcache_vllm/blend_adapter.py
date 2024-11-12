@@ -14,8 +14,6 @@ from lmcache_vllm.lmcache_utils import ENGINE_NAME
 
 logger = init_logger(__name__)
 
-# NOTE: With openai apiserver, it is possible to 
-# have duplicated request_id if very unlucky.
 class ReqId2Indices:
     def __init__(self):
         self._map_dict = {}
@@ -98,21 +96,9 @@ def drop_blend_spt(request_id, prompt: List[int]) -> List[int]:
     global_req_id2indices.add_request(request_id, indices)
     return new_prompt
 
-def get_blend_indices(request_id, len_of_prompt: int) -> List[int]:
-    # NOTE: Always adjust the last index to the end of the request.
+def get_blend_indices(request_id) -> List[int]:
     indices = global_req_id2indices.get_request(request_id)
-    if indices is None:
-        logger.warning("indices is None, possible due to duplicated request_id")
-        return [0, len_of_prompt]
-    assert len(indices) >= 2
-    assert indices[0] == 0
-    if indices[-1] > len_of_prompt:
-        # Only possible when duplicated request_id, resulting in wrong indices.
-        logger.warning("indices not matching prompt length, possible due to duplicated request_id")
-        return [0, len_of_prompt]
-    else:
-        indices[-1] = len_of_prompt
-        return indices
+    return indices if indices is not None else []
 
 def remove_request_id_indices(request_id):
     global_req_id2indices.delete_request(request_id)
@@ -224,9 +210,9 @@ def attach_blend_prompt_indices(
         for seqid, seq_data in seq_group_metadata.seq_data.items():
             seq_len = seq_lens[seq_data_idx]
             if seq_group_metadata.block_tables is not None:
-                indices = get_blend_indices(seq_group_metadata.request_id, seq_len)
+                indices = get_blend_indices(seq_group_metadata.request_id)
             else:
-                indices = [0, seq_len]
+                indices = []
             attn_metadata.blend_metadata.request_prompt_list.append(torch.tensor(
                 seq_data.get_token_ids()[:seq_len], device="cpu"))
             attn_metadata.blend_metadata.prompt_indices_list.append(indices)
