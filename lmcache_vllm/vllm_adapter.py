@@ -31,19 +31,6 @@ logger = init_logger(__name__)
 
 LMCACHE_CUDA_STREAM = torch.cuda.Stream()
 
-TORCH_DTYPE_TO_STR_DTYPE = {
-    torch.half: "half",
-    torch.float16: "half",
-    torch.bfloat16: "bfloat16",
-    torch.float: "float",
-    torch.float32: "float",
-    torch.float64: "double",
-    torch.double: "double",
-    torch.uint8: "fp8",
-    torch.float8_e4m3fn: "fp8_e4m3", 
-    torch.float8_e5m2: "fp8_e5m2",
-}
-
 class StoreStatus(Enum):
     PREFILL = 1
     CHUNK_PREFILL = 2
@@ -179,21 +166,23 @@ def init_lmcache_engine(
         return 
 
     config = lmcache_get_config()
+    
+    kv_dtype = get_kv_cache_torch_dtype(cache_config.cache_dtype, model_config.dtype)
 
-    # If KV cache's dtype is "auto", enforce it to be the same with model's dtype
-    if cache_config.cache_dtype == "auto":
-        kv_cache_torch_dtype = get_kv_cache_torch_dtype(cache_config.cache_dtype,
-                                                        model_config.dtype)
-        kv_cache_str_dtype = TORCH_DTYPE_TO_STR_DTYPE[kv_cache_torch_dtype]
-    else:
-        kv_cache_str_dtype = cache_config.cache_dtype
-
+    # construct kv shape (for mem pool)
+    num_layer = model_config.get_num_layers(parallel_config)
+    chunk_size = config.chunk_size
+    num_kv_head = model_config.get_num_kv_heads(parallel_config)
+    head_size = model_config.get_head_size()
+    kv_shape = (num_layer, 2, chunk_size, num_kv_head, head_size)
+    
     metadata = LMCacheEngineMetadata(
             model_config.model,
             parallel_config.world_size,
             parallel_config.rank,
             "vllm",
-            kv_cache_str_dtype)
+            kv_dtype,
+            kv_shape)
     
     engine = LMCacheEngineBuilder.get_or_create(
             ENGINE_NAME,
