@@ -15,6 +15,9 @@ from lmcache_vllm.lmcache_utils import ENGINE_NAME
 logger = init_logger(__name__)
 
 class ReqId2Indices:
+    """The class for cacheblend indices.
+    Map request_id to indices to split the prompt.
+    """
     def __init__(self):
         self._map_dict = {}
     def add_request(self, request_id, indices):
@@ -90,6 +93,16 @@ def init_cacheblend_retriever():
 # MAIN FUNCTIONS
 
 def drop_blend_spt(request_id, prompt: List[int]) -> List[int]:
+    """Drop the SPT tokens from the prompt and return the new prompt.
+    Also stores the indices for later retrieval.
+    :param request_id: The request id in sequence group.
+
+    :param prompt: The input prompt after tokenization.
+    :type prompt: List[int]
+
+    :return: The new prompt after dropping the SPT tokens.
+    :rtype: List[int]
+    """
     if global_blend_retriever is None:
         init_cacheblend_retriever()
     new_prompt, indices = global_blend_retriever.drop_spt_and_get_indices(prompt)
@@ -97,10 +110,20 @@ def drop_blend_spt(request_id, prompt: List[int]) -> List[int]:
     return new_prompt
 
 def get_blend_indices(request_id) -> List[int]:
+    """Get the indices after split for the request id.
+    :param request_id: The request id in sequence group.
+
+    :return: The indices for the request id.
+    :rtype: List[int]
+    """
     indices = global_req_id2indices.get_request(request_id)
     return indices if indices is not None else []
 
 def remove_request_id_indices(request_id):
+    """Remove stored indices of request id.
+    Called when a sequence group is finished.
+    :param request_id: The request id in sequence group.
+    """
     global_req_id2indices.delete_request(request_id)
 
 def combine_input_prompt_chunks(
@@ -201,6 +224,13 @@ def attach_blend_prompt_indices(
         seq_group_metadata_list: List[SequenceGroupMetadata],
         attn_metadata: AttentionMetadata,
     ):
+    """Attach the prompts and indices after split to blend_metadata in attn_metadata.
+    :param seq_group_metadata_list: The list of sequence group metadata.
+    :type seq_group_metadata_list: List[SequenceGroupMetadata]
+
+    :param attn_metadata: The attention metadata.
+    :type attn_metadata: AttentionMetadata
+    """
     assert not hasattr(attn_metadata, "blend_metadata")
     blend_metadata = BlendMetadata(0, None, None, None, [], [], None, None)
     setattr(attn_metadata, "blend_metadata", blend_metadata)
