@@ -22,6 +22,10 @@ from lmcache_vllm.blend_adapter import attach_blend_prompt_indices
 
 from lmcache_vllm.models.llama import inject_llama
 from lmcache_vllm.attention.flash_attn import inject_flash_attn
+from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.entrypoints.openai.serving_engine import AnyRequest, TextTokensPrompt
+from pydantic import Field
+from typing_extensions import Annotated
 
 from lmcache.logging import init_logger
 logger = init_logger(__name__)
@@ -264,7 +268,34 @@ async def _new_tokenize_prompt_async(
     return await tokenizer.encode_async(request_id=request_id,
                                         prompt=prompt,
                                         lora_request=lora_request)
+
+def _new_normalize_prompt_text_to_input(
+    self,
+    request: AnyRequest,
+    tokenizer: AnyTokenizer,
+    prompt: str,
+    truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]],
+    add_special_tokens: bool,
+) -> TextTokensPrompt:
     
+    # Jiayi: Patch starts here
+    tokenizer_id = tokenizer.name_or_path
+    prompt = _patch_padding_space(tokenizer_id, prompt)
+    # Jiayi: Patch ends here
+
+    if truncate_prompt_tokens is None:
+        encoded = tokenizer(prompt, add_special_tokens=add_special_tokens)
+    else:
+        encoded = tokenizer(prompt,
+                            add_special_tokens=add_special_tokens,
+                            truncation=True,
+                            max_length=truncate_prompt_tokens)
+    
+    input_ids = encoded.input_ids
+    
+    input_text = prompt
+
+    return self._validate_input(request, input_ids, input_text)
 
 def new_log_task_completion(task: asyncio.Task,
                             error_callback) -> None:
@@ -454,13 +485,17 @@ def inject_blend():
     vllm.inputs.preprocess.InputPreprocessor._extract_prompt_components_async = new_extract_prompt_components_async
 
 
+
 def InitLMCacheEnvironment() -> None:
     """Initialize the LMCache environment.
     """
-    import vllm.engine.llm_engine
-    global original_llm_engine_init
-    original_llm_engine_init = vllm.engine.llm_engine.LLMEngine.__init__
-    vllm.engine.llm_engine.LLMEngine.__init__ = new_llm_engine_init
+    
+    # FIXME(Jiayi): commenting the following injection out due to error:
+    # TypeError: LLMEngine.__init__() takes from 14 to 17 positional arguments but 18 were given
+    #import vllm.engine.llm_engine
+    #global original_llm_engine_init
+    #original_llm_engine_init = vllm.engine.llm_engine.LLMEngine.__init__
+    #vllm.engine.llm_engine.LLMEngine.__init__ = new_llm_engine_init
     
     import vllm.worker.model_runner 
     vllm.worker.model_runner.ModelRunner.execute_model = new_execute_model
@@ -483,6 +518,10 @@ def InitLMCacheEnvironment() -> None:
     import vllm
     vllm.inputs.preprocess.InputPreprocessor._tokenize_prompt = _new_tokenize_prompt
     vllm.inputs.preprocess.InputPreprocessor._tokenize_prompt_async = _new_tokenize_prompt_async
+    
+    # inject tokenizer in openai server
+    vllm.entrypoints.openai.serving_engine.OpenAIServing._normalize_prompt_text_to_input = \
+        _new_normalize_prompt_text_to_input
     
     # Cacheblend
     if lmcache_get_config().enable_blending:
