@@ -11,6 +11,7 @@ from vllm.multimodal import MultiModalInputs
 from vllm.lora.request import LoRARequest
 from vllm.worker.model_runner_base import dump_input_when_exception
 from vllm.distributed import get_pp_group
+from vllm.forward_context import set_forward_context
 
 from lmcache_vllm.vllm_adapter import (lmcache_get_config,
         init_lmcache_engine, lmcache_should_store, lmcache_should_retrieve,
@@ -103,7 +104,7 @@ def new_execute_model(
     seqlen_agnostic_kwargs = {
         "finished_requests_ids": model_input.finished_requests_ids,
         "request_ids_to_seq_ids": model_input.request_ids_to_seq_ids,
-    } if self.has_seqlen_agnostic else {}
+    } if self.has_inner_state else {}
     if (self.observability_config is not None
             and self.observability_config.collect_model_forward_time):
         model_forward_start = torch.cuda.Event(enable_timing=True)
@@ -111,15 +112,16 @@ def new_execute_model(
         model_forward_start.record()
 
     if not is_skip:
-        hidden_or_intermediate_states = model_executable(
-            input_ids=model_input.input_tokens,
-            positions=model_input.input_positions,
-            kv_caches=kv_caches,
-            attn_metadata=model_input.attn_metadata,
-            intermediate_tensors=intermediate_tensors,
-            **MultiModalInputs.as_kwargs(multi_modal_kwargs,
-                                        device=self.device),
-            **seqlen_agnostic_kwargs)
+        with set_forward_context(model_input.attn_metadata):
+            hidden_or_intermediate_states = model_executable(
+                input_ids=model_input.input_tokens,
+                positions=model_input.input_positions,
+                kv_caches=kv_caches,
+                attn_metadata=model_input.attn_metadata,
+                intermediate_tensors=intermediate_tensors,
+                **MultiModalInputs.as_kwargs(multi_modal_kwargs,
+                                            device=self.device),
+                **seqlen_agnostic_kwargs)
 
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
