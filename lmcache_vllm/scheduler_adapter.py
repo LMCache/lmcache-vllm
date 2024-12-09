@@ -6,7 +6,7 @@ from typing import (Callable, Deque, Dict, Iterable, List, Optional, Set,
 from itertools import compress
 
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
-from vllm.core.scheduler import (SchedulingBudget, SchedulerRunningOutputs, SchedulerOutputs,
+from vllm.core.scheduler import (PreemptionMode, SchedulingBudget, SchedulerRunningOutputs, SchedulerOutputs,
                                  SchedulerPrefillOutputs, SchedulerSwappedInOutputs,
                                  seq_group_metadata_builder, scheduler_running_outputs_builder,
                                  scheduled_seq_group_builder)
