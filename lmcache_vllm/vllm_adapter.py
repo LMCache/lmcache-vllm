@@ -519,6 +519,8 @@ def lmcache_retrieve_kv(
     """
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
     assert engine is not None, "LMCache engine is not initialized."
+    if engine.config.enable_blending:
+        return model_input, False
 
     query_start_loc = model_input.attn_metadata.query_start_loc
     slot_mapping = model_input.attn_metadata.slot_mapping.flatten()
@@ -790,3 +792,4 @@ def build_partial_prefill_input(
     )
 
     return rebuilt_model_input
+
