@@ -19,12 +19,13 @@ from vllm.sequence import SequenceGroupMetadata
 from vllm.config import ModelConfig, ParallelConfig, CacheConfig
 from vllm.utils import get_kv_cache_torch_dtype
 
-from lmcache.logging import init_logger
+
 from lmcache.cache_engine import LMCacheEngine, LMCacheEngineBuilder
-from lmcache.config import LMCacheEngineConfig, LMCacheEngineMetadata
+from lmcache.logging import init_logger
+from lmcache.config import LMCacheEngineMetadata
 from lmcache.utils import _lmcache_nvtx_annotate
-from lmcache_vllm.lmcache_utils import ENGINE_NAME
-from lmcache_vllm.blend_adapter import drop_blend_spt, remove_request_id_indices
+from lmcache_vllm.lmcache_utils import ENGINE_NAME, lmcache_get_config
+from lmcache_vllm.blend_adapter import remove_request_id_indices
 
 logger = init_logger(__name__)
 
@@ -101,36 +102,7 @@ def create_model_input_subset(
     return model_input_subset
 
 
-def lmcache_get_config() -> LMCacheEngineConfig:
-    """Get the LMCache configuration from the environment variable
-    `LMCACHE_CONFIG_FILE`. If the environment variable is not set, this
-    function will return the default configuration.
-    """
-    if hasattr(lmcache_get_config, "cached_config"):
-        return lmcache_get_config.cached_config
 
-    if "LMCACHE_CONFIG_FILE" not in os.environ:
-        logger.warn("No LMCache configuration file is set. Returning default config")
-        logger.warn("Please set the configuration file through "
-                    "the environment variable: LMCACHE_CONFIG_FILE")
-        config = LMCacheEngineConfig.from_defaults(
-                local_device = "cpu",
-                remote_url = None,
-                remote_serde = None,
-                pipelined_backend = False)
-    else:
-        config_file = os.environ["LMCACHE_CONFIG_FILE"]
-        logger.info(f"Loading LMCache config file {config_file}")
-        config = LMCacheEngineConfig.from_file(config_file)
-
-    lmcache_get_config.cached_config = config
-    return config
-
-def lmcache_blend_drop_spt(request_id, prompt: List[int]) -> List[int]:
-    engine = LMCacheEngineBuilder.get(ENGINE_NAME)
-    assert engine is not None
-    assert engine.config.enable_blending
-    return drop_blend_spt(request_id, prompt)
 
 def lmcache_remove_request_id_indices(request_id):
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
