@@ -36,7 +36,13 @@ class ReqId2Indices:
     
 global_req_id2indices = ReqId2Indices()
 
-global_blend_separator = None
+
+def get_blend_separator():
+    if not hasattr(get_blend_separator, "global_blend_separator"):
+        lmcache_config = lmcache_get_config()
+        get_blend_separator.global_blend_separator = lmcache_config.blend_separator
+    return get_blend_separator.global_blend_separator
+
 global_blend_retriever = None
 g_manually_disabled = False
 
@@ -91,8 +97,8 @@ def init_cacheblend_retriever():
         raise RuntimeError("Cannot initialize cache blend logic because LMCacheEngine is not initialized")
 
     # FIXME: we are trying to read metadata from cache_engine, which breaks the encapsulation
-    global global_blend_retriever 
-    global_blend_retriever = SPTBlendRetriever(TEMP_SPT, cache_engine, cache_engine.metadata)
+    global global_blend_retriever
+    global_blend_retriever = SPTBlendRetriever(cache_engine, cache_engine.metadata)
 
 
 
@@ -133,11 +139,8 @@ def combine_input_prompt_chunks(
     :return: The combined input tensor
     :rtype: torch.Tensor
     """
-    if global_blend_separator is None:
-        lmcache_config = lmcache_get_config()
-        global global_blend_separator
-        global_blend_separator = lmcache_config.blend_separator
-    return global_blend_separator.join(prompt_chunks)
+    blend_separator = get_blend_separator()
+    return blend_separator.join(prompt_chunks)
 
 
 class KVPreCompute(ABC):
@@ -231,11 +234,8 @@ def append_separator(
     :return: The input prompt with the special separator appended
     :rtype: str
     """
-    if global_blend_separator is None:
-        lmcache_config = lmcache_get_config()
-        global global_blend_separator
-        global_blend_separator = lmcache_config.blend_separator
-    return input_prompt + global_blend_separator
+    blend_separator = get_blend_separator()
+    return input_prompt + blend_separator
 
 def disable_blend():
     global g_manually_disabled
@@ -331,12 +331,6 @@ def attach_blend_prompt_indices(
             seq_data_idx += 1
     assert seq_data_idx == len(seq_lens)
 
-def get_blend_separator():
-    if global_blend_separator is None:
-        global global_blend_separator
-        lmcache_config = lmcache_get_config()
-        global_blend_separator = lmcache_config.blend_separator
-    return global_blend_separator
 
 def do_blend(
         fresh_q: torch.Tensor,
