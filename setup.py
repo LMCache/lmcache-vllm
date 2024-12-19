@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="lmcache_vllm",
-    version="0.6.2.2",
+    version="0.6.2.3",
     description = "lmcache_vllm: LMCache's wrapper for vllm",
     author = "LMCache team",
     author_email = "lmcacheteam@gmail.com",
@@ -10,7 +10,7 @@ setup(
     #long_description_content_type='text/markdown',
     packages=find_packages(),
     install_requires=[
-        "lmcache==0.1.3",
+        "lmcache>=0.1.4",
         "vllm>=0.6.1.post2,<=0.6.2",
     ],
     entry_points={
