@@ -17,6 +17,7 @@ from vllm.sequence import SequenceGroupMetadata
 from vllm import SamplingParams
 from vllm.inputs.data import TokensPrompt
 from vllm.entrypoints.llm import LLM
+from vllm.distributed import tensor_model_parallel_all_reduce, get_tensor_model_parallel_world_size
 from lmcache_vllm.lmcache_utils import ENGINE_NAME, lmcache_get_config
 
 logger = init_logger(__name__)
@@ -296,7 +297,9 @@ def process_new_request(
         attn_metadata.blend_metadata.prompt_indices_list
     )
     RECOMP_RATIO = cache_engine.config.blend_recompute_ratio
-    executor = CacheBlendImpl(RECOMP_RATIO)
+    tp_size = get_tensor_model_parallel_world_size()
+    reduce_func = tensor_model_parallel_all_reduce if tp_size > 1 else None
+    executor = CacheBlendImpl(RECOMP_RATIO, reduce_func)
     attn_metadata.blend_metadata.positions = positions
     attn_metadata.blend_metadata.retrieval_task = task
     attn_metadata.blend_metadata.blend_executor = executor
