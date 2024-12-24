@@ -5,7 +5,7 @@ import torch
 import asyncio
 import dataclasses
 from dataclasses import fields
-from typing import Optional, List, Set, Dict, Any
+from typing import Optional, List, Set, Dict, Any, Union, AsyncGenerator
 import inspect
 
 from vllm.multimodal import MultiModalInputs
@@ -618,6 +618,185 @@ async def new_tokenizer_group_encode_async(self,
     self._raise_if_input_too_long(ret, lora_request)
     return ret
 
+from vllm.entrypoints.openai.serving_chat import ChatCompletionRequest, ChatCompletionResponse, ErrorResponse, RequestResponseMetadata, Request
+from vllm.entrypoints.openai.serving_chat import parse_chat_messages_futures, apply_mistral_chat_template, apply_hf_chat_template
+from vllm.utils import iterate_with_cancellation, random_uuid
+from vllm.tracing import (contains_trace_headers, extract_trace_headers,
+                          log_tracing_disabled_warning)
+from vllm.inputs import TokensPrompt
+async def new_create_chat_completion(
+    self,
+    request: ChatCompletionRequest,
+    raw_request: Optional[Request] = None,
+) -> Union[AsyncGenerator[str, None], ChatCompletionResponse,
+        ErrorResponse]:
+    """Completion API similar to OpenAI's API.
+
+    See https://platform.openai.com/docs/api-reference/chat/create
+    for the API specification. This API mimics the OpenAI
+    ChatCompletion API.
+
+    """
+    error_check_ret = await self._check_model(request)
+    if error_check_ret is not None:
+        logger.error("Error with model %s", error_check_ret)
+        return error_check_ret
+
+    # If the engine is dead, raise the engine's DEAD_ERROR.
+    # This is required for the streaming case, where we return a
+    # success status before we actually start generating text :).
+    if self.engine_client.errored:
+        raise self.engine_client.dead_error
+
+    try:
+        (
+            lora_request,
+            prompt_adapter_request,
+        ) = self._maybe_get_adapters(request)
+
+        model_config = self.model_config
+        tokenizer = await self.engine_client.get_tokenizer(lora_request)
+
+        conversation, mm_data_future = parse_chat_messages_futures(
+            request.messages, model_config, tokenizer)
+
+        tool_dicts = None if request.tools is None else [
+            tool.model_dump() for tool in request.tools
+        ]
+
+        prompt: Union[str, List[int]]
+        is_mistral_tokenizer = isinstance(tokenizer, MistralTokenizer)
+        if is_mistral_tokenizer:
+            prompt = apply_mistral_chat_template(
+                tokenizer,
+                messages=request.messages,
+                chat_template=request.chat_template or self.chat_template,
+                add_generation_prompt=request.add_generation_prompt,
+                tools=tool_dicts,
+                documents=request.documents,
+                **(request.chat_template_kwargs or {}),
+            )
+        else:
+            prompt = apply_hf_chat_template(
+                tokenizer,
+                conversation=conversation,
+                chat_template=request.chat_template or self.chat_template,
+                add_generation_prompt=request.add_generation_prompt,
+                tools=tool_dicts,
+                documents=request.documents,
+                **(request.chat_template_kwargs or {}),
+            )
+    except Exception as e:
+        logger.error("Error in applying chat template from request: %s", e)
+        return self.create_error_response(str(e))
+
+    try:
+        mm_data = await mm_data_future
+    except Exception as e:
+        logger.error("Error in loading multi-modal data: %s", e)
+        return self.create_error_response(str(e))
+
+    # validation for OpenAI tools
+    # tool_choice = "required" is not supported
+    if request.tool_choice == "required":
+        return self.create_error_response(
+            "tool_choice = \"required\" is not supported!")
+
+    if not is_mistral_tokenizer and request.tool_choice == "auto" and not (
+            self.enable_auto_tools and self.tool_parser is not None):
+        # for hf tokenizers, "auto" tools requires
+        # --enable-auto-tool-choice and --tool-call-parser
+        return self.create_error_response(
+            "\"auto\" tool choice requires "
+            "--enable-auto-tool-choice and --tool-call-parser to be set")
+
+    request_id = f"chat-{random_uuid()}"
+
+    request_metadata = RequestResponseMetadata(request_id=request_id)
+    if raw_request:
+        raw_request.state.request_metadata = request_metadata
+
+    try:
+        guided_decode_logits_processor = (
+            await self._guided_decode_logits_processor(request, tokenizer))
+
+        if isinstance(prompt, str):
+            prompt_inputs = self._tokenize_prompt_input(
+                request,
+                tokenizer,
+                prompt,
+                truncate_prompt_tokens=request.truncate_prompt_tokens,
+                add_special_tokens=request.add_special_tokens,
+            )
+        else:
+            assert isinstance(prompt, list) and isinstance(
+                prompt[0], int
+            ), "Prompt has to be either a string or a list of token ids"
+            prompt_inputs = TextTokensPrompt(
+                prompt=tokenizer.decode(prompt), prompt_token_ids=prompt)
+
+        assert prompt_inputs is not None
+
+        sampling_params = request.to_sampling_params(
+            tokenizer,
+            guided_decode_logits_processor,
+            default_max_tokens=self.max_model_len -
+            len(prompt_inputs["prompt_token_ids"]))
+
+        self._log_inputs(request_id,
+                        prompt_inputs,
+                        params=sampling_params,
+                        lora_request=lora_request,
+                        prompt_adapter_request=prompt_adapter_request)
+        engine_inputs = TokensPrompt(
+            prompt_token_ids=prompt_inputs["prompt_token_ids"])
+        # Sixian: Patch starts here.
+        if "blend_indices" in prompt_inputs:
+            engine_inputs["blend_indices"] = prompt_inputs["blend_indices"]
+        # Sixian: Patch ends here.
+        if mm_data is not None:
+            engine_inputs["multi_modal_data"] = mm_data
+
+        is_tracing_enabled = (await
+                            self.engine_client.is_tracing_enabled())
+        trace_headers = None
+        if is_tracing_enabled and raw_request:
+            trace_headers = extract_trace_headers(raw_request.headers)
+        if (not is_tracing_enabled and raw_request
+                and contains_trace_headers(raw_request.headers)):
+            log_tracing_disabled_warning()
+
+        result_generator = self.engine_client.generate(
+            engine_inputs,
+            sampling_params,
+            request_id,
+            lora_request=lora_request,
+            trace_headers=trace_headers,
+            prompt_adapter_request=prompt_adapter_request,
+        )
+    except ValueError as e:
+        # TODO: Use a vllm-specific Validation Error
+        return self.create_error_response(str(e))
+
+    if raw_request:
+        result_generator = iterate_with_cancellation(
+            result_generator, raw_request.is_disconnected)
+
+    # Streaming response
+    if request.stream:
+        return self.chat_completion_stream_generator(
+            request, result_generator, request_id, conversation, tokenizer,
+            request_metadata)
+
+    try:
+        return await self.chat_completion_full_generator(
+            request, result_generator, request_id, conversation, tokenizer,
+            request_metadata)
+    except ValueError as e:
+        # TODO: Use a vllm-specific Validation Error
+        return self.create_error_response(str(e))
+    
+
 def inject_blend():
     import vllm.attention.backends.abstract
     vllm.attention.backends.abstract.AttentionMetadata.asdict_zerocopy = new_asdict_zerocopy
@@ -636,6 +815,8 @@ def inject_blend():
     from vllm.transformers_utils.tokenizer_group.tokenizer_group import TokenizerGroup
     TokenizerGroup.encode = new_tokenizer_group_encode
     TokenizerGroup.encode_async = new_tokenizer_group_encode_async
+    from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+    OpenAIServingChat.create_chat_completion = new_create_chat_completion
 
 
 
