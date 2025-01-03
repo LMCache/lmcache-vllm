@@ -21,6 +21,7 @@ from vllm.utils import get_kv_cache_torch_dtype
 
 from lmcache.logging import init_logger
 from lmcache.experimental.cache_engine import LMCacheEngine, LMCacheEngineBuilder
+from lmcache.experimental.gpu_connector import VLLMNestedTupleGPUConnector
 from lmcache.experimental.config import LMCacheEngineConfig, LMCacheEngineMetadata
 from lmcache.config import LMCacheEngineMetadata
 
@@ -188,11 +189,13 @@ def init_lmcache_engine(
             "vllm",
             kv_dtype,
             kv_shape)
-    
+    hidden_dim_size = num_kv_head * head_size
+    vllm_gpu_connector = VLLMNestedTupleGPUConnector(hidden_dim_size, num_layer)
     engine = LMCacheEngineBuilder.get_or_create(
             ENGINE_NAME,
             config,
-            metadata)
+            metadata,
+            vllm_gpu_connector)
 
     return engine
 

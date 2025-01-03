@@ -486,7 +486,7 @@ def inject_blend():
 
 
 
-def InitLMCacheEnvironment() -> None:
+def InitLMCacheExperimentalEnvironment() -> None:
     """Initialize the LMCache environment.
     """
     
