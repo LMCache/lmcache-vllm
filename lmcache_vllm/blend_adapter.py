@@ -151,29 +151,7 @@ class KVPreCompute(ABC):
     @abstractmethod
     def precompute_kv(self, text_chunk):
         pass
-'''
-    def _normalize_prompt_text_to_input(
-        self,
-        request: AnyRequest,
-        tokenizer: AnyTokenizer,
-        prompt: str,
-        truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]],
-        add_special_tokens: bool,
-    ) -> TextTokensPrompt:
-        if truncate_prompt_tokens is None:
-            encoded = tokenizer(prompt, add_special_tokens=add_special_tokens)
-        else:
-            encoded = tokenizer(prompt,
-                                add_special_tokens=add_special_tokens,
-                                truncation=True,
-                                max_length=truncate_prompt_tokens)
 
-        input_ids = encoded.input_ids
-
-        input_text = prompt
-
-        return self._validate_input(request, input_ids, input_text)
-'''
 class OnlineKVPreCompute(KVPreCompute):
     def __init__(self, openai_api_key, openai_api_base, tokenizer=None):
         self.client = OpenAI(
