@@ -21,8 +21,8 @@ from vllm.utils import get_kv_cache_torch_dtype
 
 from lmcache.logging import init_logger
 from lmcache.experimental.cache_engine import LMCacheEngine, LMCacheEngineBuilder
-from lmcache.experimental.gpu_connector import VLLMNestedTupleGPUConnector
-from lmcache.experimental.config import LMCacheEngineConfig, LMCacheEngineMetadata
+from lmcache.experimental.gpu_connector import VLLMPagedMemGPUConnector
+from lmcache.experimental.config import LMCacheEngineConfig
 from lmcache.config import LMCacheEngineMetadata
 
 from lmcache.utils import _lmcache_nvtx_annotate
@@ -190,7 +190,7 @@ def init_lmcache_engine(
             kv_dtype,
             kv_shape)
     hidden_dim_size = num_kv_head * head_size
-    vllm_gpu_connector = VLLMNestedTupleGPUConnector(hidden_dim_size, num_layer)
+    vllm_gpu_connector = VLLMPagedMemGPUConnector(hidden_dim_size, num_layer)
     engine = LMCacheEngineBuilder.get_or_create(
             ENGINE_NAME,
             config,
@@ -377,9 +377,9 @@ def lmcache_should_store(
         
 
     # Determine whether to save decoded KV cache
-    if engine.save_decode_cache:
+    if engine.config.save_decode_cache:
         for idx, seq_len in enumerate(seq_lens):
-            if seq_len % engine.chunk_size == 0:
+            if seq_len % engine.config.chunk_size == 0:
                 store_status[idx] = StoreStatus.DECODE
     return store_status
 
@@ -447,14 +447,14 @@ def lmcache_store_kv(
             else:
                 seq_len = seq_data.get_len()
                 if status == StoreStatus.DECODE:
-                    if seq_len % engine.chunk_size != 0:
+                    if seq_len % engine.config.chunk_size != 0:
                         continue
             current_tokens = torch.tensor(seq_data.get_token_ids()[:seq_len], device="cpu")
             vllm_block_size = cache_config.block_size
             skip_leading_tokens = engine.lookup(current_tokens)
             assert skip_leading_tokens <= seq_len
             if skip_leading_tokens < seq_len:
-                assert skip_leading_tokens % engine.chunk_size == 0
+                assert skip_leading_tokens % engine.config.chunk_size == 0
                 slot_mapping = []
                 compute_slot_mapping(False, slot_mapping, seqid, seq_len, 
                     skip_leading_tokens, 0, vllm_block_size, seq_group_metadata.block_tables)
@@ -471,7 +471,7 @@ def lmcache_store_kv(
                     kv_tensors_mask = torch.ones_like(current_tokens, dtype=torch.bool)
                     kv_tensors_mask[:skipped_token_num] = False
                     engine.store(current_tokens.cpu(), kv_tensors_mask, 
-                                 kv_caches, slot_mapping)
+                                 kvcaches=kv_caches, slot_mapping=slot_mapping)
             else:
                 stored_token_num = 0
                 skipped_token_num = seq_len
@@ -570,7 +570,9 @@ def lmcache_retrieve_kv(
             token_mask[:vllm_num_computed_tokens] = False
             
             # call lmcache retrieve
-            ret_token_mask = engine.retrieve(full_token_tensor, token_mask)
+            ret_token_mask = engine.retrieve(
+                full_token_tensor, token_mask,
+                kvcaches=kv_caches, slot_mapping=slot_mapping)
             lmc_num_computed_tokens = torch.sum(ret_token_mask).item()
             
             # total number of computed tokens (vllm + lmc)
@@ -628,7 +630,7 @@ def lmcache_retrieve_kv(
             is_prefill_list,
             seq_group_metadata_list,
             temp_block_table_list,
-            device=kv_cache[0].device,
+            device=kv_caches[0][0].device,
         )
         logger.debug("Rebuilt the input!")
         return rebuilt_model_input, False

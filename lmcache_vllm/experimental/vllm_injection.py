@@ -12,7 +12,7 @@ from vllm.lora.request import LoRARequest
 from vllm.worker.model_runner_base import dump_input_when_exception
 from vllm.distributed import get_pp_group
 
-from lmcache_vllm.vllm_adapter import (lmcache_get_config,
+from lmcache_vllm.experimental.vllm_adapter import (lmcache_get_config,
         init_lmcache_engine, lmcache_should_store, lmcache_should_retrieve,
         lmcache_store_kv, lmcache_retrieve_kv, close_lmcache_engine,
         broadcast_seq_group_metadata, lmcache_blend_drop_spt,
@@ -489,13 +489,6 @@ def inject_blend():
 def InitLMCacheExperimentalEnvironment() -> None:
     """Initialize the LMCache environment.
     """
-    
-    # FIXME(Jiayi): commenting the following injection out due to error:
-    # TypeError: LLMEngine.__init__() takes from 14 to 17 positional arguments but 18 were given
-    #import vllm.engine.llm_engine
-    #global original_llm_engine_init
-    #original_llm_engine_init = vllm.engine.llm_engine.LLMEngine.__init__
-    #vllm.engine.llm_engine.LLMEngine.__init__ = new_llm_engine_init
     
     import vllm.worker.model_runner 
     vllm.worker.model_runner.ModelRunner.execute_model = new_execute_model
