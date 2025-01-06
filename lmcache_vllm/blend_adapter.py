@@ -1,6 +1,10 @@
 import torch
-from typing import Tuple, List, Optional, Dict, Any
+from typing import Tuple, List, Optional, Dict, Any, Union
 from dataclasses import dataclass
+from abc import ABC, abstractmethod
+from openai import OpenAI
+
+
 
 from lmcache.cache_engine import LMCacheEngineBuilder
 from lmcache.blend.executor import CacheBlendImpl
@@ -10,7 +14,11 @@ from lmcache.logging import init_logger
 
 from vllm.attention import AttentionMetadata
 from vllm.sequence import SequenceGroupMetadata
-from lmcache_vllm.lmcache_utils import ENGINE_NAME
+from vllm import SamplingParams
+from vllm.inputs.data import TokensPrompt
+from vllm.entrypoints.llm import LLM
+from vllm.distributed import tensor_model_parallel_all_reduce, get_tensor_model_parallel_world_size
+from lmcache_vllm.lmcache_utils import ENGINE_NAME, lmcache_get_config
 
 logger = init_logger(__name__)
 
@@ -29,8 +37,13 @@ class ReqId2Indices:
     
 global_req_id2indices = ReqId2Indices()
 
-# TODO: Special token text and token_id should depend on models.
-TEMP_SPT = [422, 422]
+
+def get_blend_separator():
+    if not hasattr(get_blend_separator, "global_blend_separator"):
+        lmcache_config = lmcache_get_config()
+        get_blend_separator.global_blend_separator = lmcache_config.blend_separator
+    return get_blend_separator.global_blend_separator
+
 global_blend_retriever = None
 g_manually_disabled = False
 
@@ -85,29 +98,19 @@ def init_cacheblend_retriever():
         raise RuntimeError("Cannot initialize cache blend logic because LMCacheEngine is not initialized")
 
     # FIXME: we are trying to read metadata from cache_engine, which breaks the encapsulation
-    global global_blend_retriever 
-    global_blend_retriever = SPTBlendRetriever(TEMP_SPT, cache_engine, cache_engine.metadata)
+    global global_blend_retriever
+    global_blend_retriever = SPTBlendRetriever(cache_engine, cache_engine.metadata)
 
 
 
-# MAIN FUNCTIONS
-
-def drop_blend_spt(request_id, prompt: List[int]) -> List[int]:
-    """Drop the SPT tokens from the prompt and return the new prompt.
-    Also stores the indices for later retrieval.
+def add_blend_indices(request_id, indices):
+    """Add the indices after split for the request id.
     :param request_id: The request id in sequence group.
 
-    :param prompt: The input prompt after tokenization.
-    :type prompt: List[int]
-
-    :return: The new prompt after dropping the SPT tokens.
-    :rtype: List[int]
+    :param indices: The indices for the request id.
+    :type indices: List[int]
     """
-    if global_blend_retriever is None:
-        init_cacheblend_retriever()
-    new_prompt, indices = global_blend_retriever.drop_spt_and_get_indices(prompt)
     global_req_id2indices.add_request(request_id, indices)
-    return new_prompt
 
 def get_blend_indices(request_id) -> List[int]:
     """Get the indices after split for the request id.
@@ -137,9 +140,67 @@ def combine_input_prompt_chunks(
     :return: The combined input tensor
     :rtype: torch.Tensor
     """
-    # TODO: replace hardcoded "<s>" by `tokenizer.special_tokens['bos_token']`
-    separator = " # #<s> "
-    return separator.join(prompt_chunks)
+    blend_separator = get_blend_separator()
+    return blend_separator.join(prompt_chunks)
+
+
+class KVPreCompute(ABC):
+    def __init__(self):
+        lmcache_config = lmcache_get_config()
+        self._blend_add_special_in_precomp = lmcache_config.blend_add_special_in_precomp
+    @abstractmethod
+    def precompute_kv(self, text_chunk):
+        pass
+
+class OnlineKVPreCompute(KVPreCompute):
+    def __init__(self, openai_api_key, openai_api_base, tokenizer=None):
+        self.client = OpenAI(
+            api_key=openai_api_key,
+            base_url=openai_api_base,
+        )
+        self.model = self.client.models.list().data[0].id
+        super().__init__()
+        # NOTE: Make sure to configure this tokenizer exactly the same with the one
+        # in openai api server.
+        self._tokenizer = tokenizer
+    def _gen_inputs_for_precompute(self, text_chunk: str, force_special_tokens: bool):
+        # online openai server.
+        add_special_tokens = self._blend_add_special_in_precomp or force_special_tokens
+        encoded = self._tokenizer(text_chunk, add_special_tokens=add_special_tokens)
+        input_ids = encoded.input_ids
+        # NOTE: No multi_modal_data here.
+        return input_ids
+
+    def precompute_kv(self, text_chunk: str, force_special_tokens: bool = False):
+        inputs_precomp = self._gen_inputs_for_precompute(text_chunk, force_special_tokens)
+        # Iterable[Int] as prompt
+        self.client.completions.create(
+            prompt=inputs_precomp,
+            model=self.model,
+            max_tokens=1,
+        )
+
+class OfflineKVPreCompute(KVPreCompute):
+    def __init__(self, llm):
+        self.llm: LLM = llm
+        self.sampling_params = SamplingParams(temperature=0.0,
+                                              top_p=0.95,
+                                              max_tokens=1)
+        super().__init__()
+    def _gen_inputs_for_precompute(self, text_chunk: str, force_special_tokens: bool):
+        tokenizer_group = self.llm.llm_engine.input_preprocessor.get_tokenizer_group()
+        add_special_tokens = self._blend_add_special_in_precomp or force_special_tokens
+        # NOTE: No lora now.
+        ret = tokenizer_group.encode(text_chunk, add_special_tokens=add_special_tokens)
+        # NOTE: No multi_modal_data here.
+        return TokensPrompt(prompt_token_ids=ret)
+
+    def precompute_kv(self, text_chunk: str, force_special_tokens: bool = False):
+        inputs_precomp = self._gen_inputs_for_precompute(text_chunk, force_special_tokens)
+        # TokensPrompt as prompt
+        self.llm.generate(inputs_precomp, self.sampling_params)
+
+            
 
 def append_separator(
         input_prompt: str
@@ -152,8 +213,8 @@ def append_separator(
     :return: The input prompt with the special separator appended
     :rtype: str
     """
-    separator = " # #"
-    return input_prompt + separator
+    blend_separator = get_blend_separator()
+    return input_prompt + blend_separator
 
 def disable_blend():
     global g_manually_disabled
@@ -214,7 +275,9 @@ def process_new_request(
         attn_metadata.blend_metadata.prompt_indices_list
     )
     RECOMP_RATIO = cache_engine.config.blend_recompute_ratio
-    executor = CacheBlendImpl(RECOMP_RATIO)
+    tp_size = get_tensor_model_parallel_world_size()
+    reduce_func = tensor_model_parallel_all_reduce if tp_size > 1 else None
+    executor = CacheBlendImpl(RECOMP_RATIO, reduce_func)
     attn_metadata.blend_metadata.positions = positions
     attn_metadata.blend_metadata.retrieval_task = task
     attn_metadata.blend_metadata.blend_executor = executor
