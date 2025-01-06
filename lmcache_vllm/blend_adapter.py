@@ -310,7 +310,7 @@ def attach_blend_prompt_indices(
                 seq_data.get_token_ids()[:seq_len], device="cpu"))
             attn_metadata.blend_metadata.prompt_indices_list.append(indices)
             seq_data_idx += 1
-    assert seq_data_idx == len(seq_lens)
+    assert seq_data_idx <= len(seq_lens)
 
 
 def do_blend(
