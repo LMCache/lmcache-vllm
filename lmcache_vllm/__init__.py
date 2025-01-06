@@ -36,7 +36,7 @@ def initialize_environment():
     # Check vllm and it's version
     logger.info(f"Initializing lmcache_vllm version {__version__}, supporting vllm versions: {EXPECTED_VLLM_VERSIONS}")
     assert check_library_version("vllm", EXPECTED_VLLM_VERSIONS), f"vllm {EXPECTED_VLLM_VERSIONS} not found"
-    is_experimental = os.getenv("EXPERIMENTAL")
+    is_experimental = os.getenv("LMCACHE_USE_EXPERIMENTAL")
     if is_experimental == 'True':
         InitLMCacheExperimentalEnvironment()
     else:
