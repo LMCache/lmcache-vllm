@@ -1,6 +1,10 @@
 import os
-from lmcache.config import LMCacheEngineConfig
 from lmcache.logging import init_logger
+
+if os.getenv("LMCACHE_USE_EXPERIMENTAL") == "True":
+        from lmcache.experimental.config import LMCacheEngineConfig
+else:
+    from lmcache.config import LMCacheEngineConfig
 
 logger = init_logger(__name__)
 ENGINE_NAME = "vllm-instance"
@@ -10,6 +14,7 @@ def lmcache_get_config() -> LMCacheEngineConfig:
     `LMCACHE_CONFIG_FILE`. If the environment variable is not set, this
     function will return the default configuration.
     """
+    
     if hasattr(lmcache_get_config, "cached_config"):
         return lmcache_get_config.cached_config
 

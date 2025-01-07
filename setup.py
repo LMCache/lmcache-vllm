@@ -11,7 +11,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         "lmcache>=0.1.4",
-        "vllm>=0.6.1.post2,<=0.6.2",
+        "vllm==0.6.2",
     ],
     entry_points={
         'console_scripts': [
