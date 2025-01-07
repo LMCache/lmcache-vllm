@@ -1,7 +1,9 @@
 import sys
 import importlib
+import os
 
 from lmcache_vllm.vllm_injection import InitLMCacheEnvironment
+from lmcache_vllm.experimental.vllm_injection import InitLMCacheExperimentalEnvironment
 from lmcache_vllm.vllm_adapter import close_lmcache_engine
 import lmcache_vllm.blend_adapter as blend_adapter
 
@@ -34,7 +36,11 @@ def initialize_environment():
     # Check vllm and it's version
     logger.info(f"Initializing lmcache_vllm version {__version__}, supporting vllm versions: {EXPECTED_VLLM_VERSIONS}")
     assert check_library_version("vllm", EXPECTED_VLLM_VERSIONS), f"vllm {EXPECTED_VLLM_VERSIONS} not found"
-    InitLMCacheEnvironment()
+    is_experimental = os.getenv("LMCACHE_USE_EXPERIMENTAL")
+    if is_experimental == 'True':
+        InitLMCacheExperimentalEnvironment()
+    else:
+        InitLMCacheEnvironment()
 
 initialize_environment()
 
