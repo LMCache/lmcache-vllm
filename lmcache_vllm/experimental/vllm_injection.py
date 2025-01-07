@@ -5,20 +5,24 @@ import torch
 import asyncio
 import dataclasses
 from dataclasses import fields
-from typing import Optional, List, Set, Dict, Any
+from typing import Optional, List, Set, Dict, Any, Union, AsyncGenerator
+import inspect
 
 from vllm.multimodal import MultiModalInputs
 from vllm.lora.request import LoRARequest
 from vllm.worker.model_runner_base import dump_input_when_exception
 from vllm.distributed import get_pp_group
 
-from lmcache_vllm.experimental.vllm_adapter import (lmcache_get_config,
-        init_lmcache_engine, lmcache_should_store, lmcache_should_retrieve,
+from vllm.transformers_utils.tokenizer import MistralTokenizer
+
+from lmcache_vllm.experimental.vllm_adapter import (init_lmcache_engine, 
+        lmcache_should_store, lmcache_should_retrieve,
         lmcache_store_kv, lmcache_retrieve_kv, close_lmcache_engine,
-        broadcast_seq_group_metadata, lmcache_blend_drop_spt,
+        broadcast_seq_group_metadata,
         lmcache_remove_request_id_indices, StoreStatus, RetrieveStatus,
         SUPPORTED_MODELS)
-from lmcache_vllm.blend_adapter import attach_blend_prompt_indices
+from lmcache_vllm.lmcache_utils import lmcache_get_config
+from lmcache_vllm.blend_adapter import attach_blend_prompt_indices, get_blend_separator, add_blend_indices
 
 from lmcache_vllm.models.llama import inject_llama
 from lmcache_vllm.attention.flash_attn import inject_flash_attn
@@ -245,9 +249,35 @@ def _new_tokenize_prompt(
     prompt = _patch_padding_space(tokenizer_id, prompt)
     # Jiayi: Patch ends here
 
-    return tokenizer.encode(request_id=request_id,
-                            prompt=prompt,
-                            lora_request=lora_request)
+    # Sixian: Patch starts here.
+    cache_config = lmcache_get_config()
+    if cache_config.enable_blending:
+        input_ids = []
+        blend_indices = []
+        is_first_chunk = True
+        current_idx = 0
+        blend_separator = get_blend_separator()
+        text_chunk_list = prompt.split(blend_separator)
+        for text_chunk in text_chunk_list:
+            force_no_special_tokens = not is_first_chunk and not cache_config.blend_add_special_in_precomp
+            effective_add_special_tokens = not force_no_special_tokens
+            encoded = tokenizer.encode(request_id=request_id,
+                                       prompt=text_chunk,
+                                       lora_request=lora_request,
+                                       add_special_tokens=effective_add_special_tokens)
+            input_ids.extend(encoded)
+            current_idx += len(encoded)
+            blend_indices.append(current_idx)
+            is_first_chunk = False
+        if len(blend_indices) > 0:
+            blend_indices.pop()
+        add_blend_indices(request_id, blend_indices)
+        return input_ids
+    # Sixian: Patch ends here.
+    else:
+        return tokenizer.encode(request_id=request_id,
+                                prompt=prompt,
+                                lora_request=lora_request)
     
 
 async def _new_tokenize_prompt_async(
@@ -265,10 +295,35 @@ async def _new_tokenize_prompt_async(
     prompt = _patch_padding_space(tokenizer_id, prompt)
     # Jiayi: Patch ends here
 
-    return await tokenizer.encode_async(request_id=request_id,
-                                        prompt=prompt,
-                                        lora_request=lora_request)
-
+    # Sixian: Patch starts here.
+    cache_config = lmcache_get_config()
+    if cache_config.enable_blending:
+        input_ids = []
+        blend_indices = []
+        is_first_chunk = True
+        current_idx = 0
+        blend_separator = get_blend_separator()
+        text_chunk_list = prompt.split(blend_separator)
+        for text_chunk in text_chunk_list:
+            force_no_special_tokens = not is_first_chunk and not cache_config.blend_add_special_in_precomp
+            effective_add_special_tokens = not force_no_special_tokens
+            encoded = await tokenizer.encode_async(request_id=request_id,
+                                                   prompt=text_chunk,
+                                                   lora_request=lora_request,
+                                                   add_special_tokens=effective_add_special_tokens)
+            input_ids.extend(encoded)
+            current_idx += len(encoded)
+            blend_indices.append(current_idx)
+            is_first_chunk = False
+        if len(blend_indices) > 0:
+            blend_indices.pop()
+        add_blend_indices(request_id, blend_indices)
+        return input_ids
+    # Sixian: Patch ends here.
+    else:
+        return await tokenizer.encode_async(request_id=request_id,
+                                            prompt=prompt,
+                                            lora_request=lora_request)
 def _new_normalize_prompt_text_to_input(
     self,
     request: AnyRequest,
@@ -283,19 +338,51 @@ def _new_normalize_prompt_text_to_input(
     prompt = _patch_padding_space(tokenizer_id, prompt)
     # Jiayi: Patch ends here
 
-    if truncate_prompt_tokens is None:
-        encoded = tokenizer(prompt, add_special_tokens=add_special_tokens)
+    # Sixian: Patch starts here.
+    cache_config = lmcache_get_config()
+    if cache_config.enable_blending:
+        blend_separator = get_blend_separator()
+        text_chunk_list = prompt.split(blend_separator)
+        input_ids = []
+        input_text = ""
+        blend_indices = []
+        current_idx = 0
+        is_first_chunk = True
+        for text_chunk in text_chunk_list:
+            force_no_special_tokens = not is_first_chunk and not cache_config.blend_add_special_in_precomp
+            effective_add_special_tokens = add_special_tokens and not force_no_special_tokens
+            if truncate_prompt_tokens is None:
+                encoded = tokenizer(text_chunk, add_special_tokens=effective_add_special_tokens)
+            else:
+                encoded = tokenizer(text_chunk, 
+                                    add_special_tokens=effective_add_special_tokens,
+                                    truncation=True,
+                                    max_length=truncate_prompt_tokens)
+            input_ids.extend(encoded.input_ids)
+            input_text += text_chunk
+            current_idx += len(encoded.input_ids)
+            blend_indices.append(current_idx)
+            is_first_chunk = False
+        text_tokens_prompt: TextTokensPrompt = self._validate_input(request, input_ids, input_text)
+        if len(blend_indices) > 0:
+            blend_indices.pop()
+        text_tokens_prompt["blend_indices"] = blend_indices
+        return text_tokens_prompt
+    # Sixian: Patch ends here.
     else:
-        encoded = tokenizer(prompt,
-                            add_special_tokens=add_special_tokens,
-                            truncation=True,
-                            max_length=truncate_prompt_tokens)
-    
-    input_ids = encoded.input_ids
-    
-    input_text = prompt
+        if truncate_prompt_tokens is None:
+            encoded = tokenizer(prompt, add_special_tokens=add_special_tokens)
+        else:
+            encoded = tokenizer(prompt,
+                                add_special_tokens=add_special_tokens,
+                                truncation=True,
+                                max_length=truncate_prompt_tokens)
 
-    return self._validate_input(request, input_ids, input_text)
+        input_ids = encoded.input_ids
+
+        input_text = prompt
+
+        return self._validate_input(request, input_ids, input_text)
 
 def new_log_task_completion(task: asyncio.Task,
                             error_callback) -> None:
@@ -410,6 +497,12 @@ def new_extract_prompt_components(self,
                                   inputs,
                                   request_id,
                                   lora_request = None):
+    # If passed in the form of token_ids, should have blend_indices.
+    # else should handle in tokenize_prompt.
+    if isinstance(inputs, dict):
+        if "blend_indices" in inputs:
+            blend_indices = inputs.pop("blend_indices")
+            add_blend_indices(request_id, blend_indices)
     prompt, prompt_token_ids, multi_modal_data = original_extract_prompt_components(self, inputs, request_id, lora_request)
     prompt_token_ids = lmcache_blend_drop_spt(request_id, prompt_token_ids)
     return prompt, prompt_token_ids, multi_modal_data
@@ -420,6 +513,10 @@ async def new_extract_prompt_components_async(
         request_id,
         lora_request = None,
     ):
+    if isinstance(inputs, dict):
+        if "blend_indices" in inputs:
+            blend_indices = inputs.pop("blend_indices")
+            add_blend_indices(request_id, blend_indices)
     prompt, prompt_token_ids, multi_modal_data = await original_extract_prompt_components_async(
         self, inputs, request_id, lora_request)
     prompt_token_ids = lmcache_blend_drop_spt(request_id, prompt_token_ids)
@@ -448,25 +545,255 @@ def new_llm_engine_init(
         input_registry: InputRegistry = INPUT_REGISTRY,
         use_cached_outputs: bool = False,
     ) -> None:
-    original_llm_engine_init(self,
-                             model_config,
-                             cache_config,
-                             parallel_config,
-                             scheduler_config,
-                             device_config,
-                             load_config,
-                             lora_config,
-                             speculative_config,
-                             decoding_config,
-                             observability_config,
-                             prompt_adapter_config,
-                             executor_class,
-                             log_stats,
-                             usage_context,
-                             stat_loggers,
-                             input_registry,
-                             use_cached_outputs)
+    if use_cached_outputs:
+        original_llm_engine_init(self,
+                                model_config,
+                                cache_config,
+                                parallel_config,
+                                scheduler_config,
+                                device_config,
+                                load_config,
+                                lora_config,
+                                speculative_config,
+                                decoding_config,
+                                observability_config,
+                                prompt_adapter_config,
+                                executor_class,
+                                log_stats,
+                                usage_context,
+                                stat_loggers,
+                                input_registry,
+                                use_cached_outputs)
+    else:
+        original_llm_engine_init(self,
+                                model_config,
+                                cache_config,
+                                parallel_config,
+                                scheduler_config,
+                                device_config,
+                                load_config,
+                                lora_config,
+                                speculative_config,
+                                decoding_config,
+                                observability_config,
+                                prompt_adapter_config,
+                                executor_class,
+                                log_stats,
+                                usage_context,
+                                stat_loggers,
+                                input_registry)
     init_lmcache_engine(model_config, parallel_config, cache_config)
+    
+def new_tokenizer_group_encode(self,
+                         prompt: str,
+                         request_id: Optional[str] = None,
+                         lora_request: Optional[LoRARequest] = None,
+                         add_special_tokens: bool = True) -> List[int]:
+    tokenizer = self.get_lora_tokenizer(lora_request)
+    # If the function accepts add_special_tokens, we should pass it
+    # It defaults to True.
+    signature = inspect.signature(tokenizer.encode)
+    if "add_special_tokens" in signature.parameters:
+        ret = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+    else:
+        assert type(tokenizer) == MistralTokenizer
+        # NOTE: MistralTokenizer always sets second value to True in encode
+        # even if add_special_tokens is False, here I changed the behavior.
+        ret = tokenizer.tokenizer.encode(prompt, bos=add_special_tokens, eos=False)
+    self._raise_if_input_too_long(ret, lora_request)
+    return ret
+
+
+async def new_tokenizer_group_encode_async(self,
+                                    prompt: str,
+                                    request_id: Optional[str] = None,
+                                    lora_request: Optional[LoRARequest] = None,
+                                    add_special_tokens: bool = True) -> List[int]:
+    tokenizer = await self.get_lora_tokenizer_async(lora_request)
+    signature = inspect.signature(tokenizer.encode)
+    if "add_special_tokens" in signature.parameters:
+        ret = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+    else:
+        assert type(tokenizer) == MistralTokenizer
+        ret = tokenizer.tokenizer.encode(prompt, bos=add_special_tokens, eos=False)
+    self._raise_if_input_too_long(ret, lora_request)
+    return ret
+
+from vllm.entrypoints.openai.serving_chat import ChatCompletionRequest, ChatCompletionResponse, ErrorResponse, RequestResponseMetadata, Request
+from vllm.entrypoints.openai.serving_chat import parse_chat_messages_futures, apply_mistral_chat_template, apply_hf_chat_template
+from vllm.utils import iterate_with_cancellation, random_uuid
+from vllm.tracing import (contains_trace_headers, extract_trace_headers,
+                          log_tracing_disabled_warning)
+from vllm.inputs import TokensPrompt
+async def new_create_chat_completion(
+    self,
+    request: ChatCompletionRequest,
+    raw_request: Optional[Request] = None,
+) -> Union[AsyncGenerator[str, None], ChatCompletionResponse,
+        ErrorResponse]:
+    """Completion API similar to OpenAI's API.
+    See https://platform.openai.com/docs/api-reference/chat/create
+    for the API specification. This API mimics the OpenAI
+    ChatCompletion API.
+    """
+    error_check_ret = await self._check_model(request)
+    if error_check_ret is not None:
+        logger.error("Error with model %s", error_check_ret)
+        return error_check_ret
+
+    # If the engine is dead, raise the engine's DEAD_ERROR.
+    # This is required for the streaming case, where we return a
+    # success status before we actually start generating text :).
+    if self.engine_client.errored:
+        raise self.engine_client.dead_error
+
+    try:
+        (
+            lora_request,
+            prompt_adapter_request,
+        ) = self._maybe_get_adapters(request)
+
+        model_config = self.model_config
+        tokenizer = await self.engine_client.get_tokenizer(lora_request)
+
+        conversation, mm_data_future = parse_chat_messages_futures(
+            request.messages, model_config, tokenizer)
+
+        tool_dicts = None if request.tools is None else [
+            tool.model_dump() for tool in request.tools
+        ]
+
+        prompt: Union[str, List[int]]
+        is_mistral_tokenizer = isinstance(tokenizer, MistralTokenizer)
+        if is_mistral_tokenizer:
+            prompt = apply_mistral_chat_template(
+                tokenizer,
+                messages=request.messages,
+                chat_template=request.chat_template or self.chat_template,
+                add_generation_prompt=request.add_generation_prompt,
+                tools=tool_dicts,
+                documents=request.documents,
+                **(request.chat_template_kwargs or {}),
+            )
+        else:
+            prompt = apply_hf_chat_template(
+                tokenizer,
+                conversation=conversation,
+                chat_template=request.chat_template or self.chat_template,
+                add_generation_prompt=request.add_generation_prompt,
+                tools=tool_dicts,
+                documents=request.documents,
+                **(request.chat_template_kwargs or {}),
+            )
+    except Exception as e:
+        logger.error("Error in applying chat template from request: %s", e)
+        return self.create_error_response(str(e))
+
+    try:
+        mm_data = await mm_data_future
+    except Exception as e:
+        logger.error("Error in loading multi-modal data: %s", e)
+        return self.create_error_response(str(e))
+
+    # validation for OpenAI tools
+    # tool_choice = "required" is not supported
+    if request.tool_choice == "required":
+        return self.create_error_response(
+            "tool_choice = \"required\" is not supported!")
+
+    if not is_mistral_tokenizer and request.tool_choice == "auto" and not (
+            self.enable_auto_tools and self.tool_parser is not None):
+        # for hf tokenizers, "auto" tools requires
+        # --enable-auto-tool-choice and --tool-call-parser
+        return self.create_error_response(
+            "\"auto\" tool choice requires "
+            "--enable-auto-tool-choice and --tool-call-parser to be set")
+
+    request_id = f"chat-{random_uuid()}"
+
+    request_metadata = RequestResponseMetadata(request_id=request_id)
+    if raw_request:
+        raw_request.state.request_metadata = request_metadata
+
+    try:
+        guided_decode_logits_processor = (
+            await self._guided_decode_logits_processor(request, tokenizer))
+
+        if isinstance(prompt, str):
+            prompt_inputs = self._tokenize_prompt_input(
+                request,
+                tokenizer,
+                prompt,
+                truncate_prompt_tokens=request.truncate_prompt_tokens,
+                add_special_tokens=request.add_special_tokens,
+            )
+        else:
+            assert isinstance(prompt, list) and isinstance(
+                prompt[0], int
+            ), "Prompt has to be either a string or a list of token ids"
+            prompt_inputs = TextTokensPrompt(
+                prompt=tokenizer.decode(prompt), prompt_token_ids=prompt)
+
+        assert prompt_inputs is not None
+
+        sampling_params = request.to_sampling_params(
+            tokenizer,
+            guided_decode_logits_processor,
+            default_max_tokens=self.max_model_len -
+            len(prompt_inputs["prompt_token_ids"]))
+
+        self._log_inputs(request_id,
+                        prompt_inputs,
+                        params=sampling_params,
+                        lora_request=lora_request,
+                        prompt_adapter_request=prompt_adapter_request)
+        engine_inputs = TokensPrompt(
+            prompt_token_ids=prompt_inputs["prompt_token_ids"])
+        # Sixian: Patch starts here.
+        if "blend_indices" in prompt_inputs:
+            engine_inputs["blend_indices"] = prompt_inputs["blend_indices"]
+        # Sixian: Patch ends here.
+        if mm_data is not None:
+            engine_inputs["multi_modal_data"] = mm_data
+
+        is_tracing_enabled = (await
+                            self.engine_client.is_tracing_enabled())
+        trace_headers = None
+        if is_tracing_enabled and raw_request:
+            trace_headers = extract_trace_headers(raw_request.headers)
+        if (not is_tracing_enabled and raw_request
+                and contains_trace_headers(raw_request.headers)):
+            log_tracing_disabled_warning()
+
+        result_generator = self.engine_client.generate(
+            engine_inputs,
+            sampling_params,
+            request_id,
+            lora_request=lora_request,
+            trace_headers=trace_headers,
+            prompt_adapter_request=prompt_adapter_request,
+        )
+    except ValueError as e:
+        # TODO: Use a vllm-specific Validation Error
+        return self.create_error_response(str(e))
+
+    if raw_request:
+        result_generator = iterate_with_cancellation(
+            result_generator, raw_request.is_disconnected)
+
+    # Streaming response
+    if request.stream:
+        return self.chat_completion_stream_generator(
+            request, result_generator, request_id, conversation, tokenizer,
+            request_metadata)
+
+    try:
+        return await self.chat_completion_full_generator(
+            request, result_generator, request_id, conversation, tokenizer,
+            request_metadata)
+    except ValueError as e:
+        # TODO: Use a vllm-specific Validation Error
+        return self.create_error_response(str(e))
 
 def inject_blend():
     import vllm.attention.backends.abstract
