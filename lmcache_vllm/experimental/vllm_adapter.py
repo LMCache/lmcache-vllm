@@ -438,8 +438,10 @@ def lmcache_store_kv(
                     skipped_token_num = seq_len - stored_token_num
                     kv_tensors_mask = torch.ones_like(current_tokens, dtype=torch.bool)
                     kv_tensors_mask[:skipped_token_num] = False
+                    slot_mapping_gpu = torch.tensor(slot_mapping, device=kv_caches[0][0].device)
                     engine.store(current_tokens.cpu(), kv_tensors_mask, 
-                                 kvcaches=kv_caches, slot_mapping=slot_mapping)
+                                 kvcaches=kv_caches, slot_mapping=slot_mapping_gpu,
+                                 offset=skipped_token_num)
             else:
                 stored_token_num = 0
                 skipped_token_num = seq_len
