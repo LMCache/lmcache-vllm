@@ -333,7 +333,17 @@ def _new_normalize_prompt_text_to_input(
 ) -> TextTokensPrompt:
 
     # Jiayi: Patch starts here
-    tokenizer_id = tokenizer.name_or_path
+    
+    # (HACK) Check if tokenizer has a name_or_path attribute
+    if hasattr(tokenizer, "name_or_path"):
+        tokenizer_id = tokenizer.name_or_path
+    elif hasattr(tokenizer, "mistral"):
+        tokenizer_id = "mistral"
+    else:
+        logger.warning("Tokenizer does not have a name_or_path attribute")
+        logger.info("Using default tokenizer_id (LLama)")
+        tokenizer_id = "meta-llama/Llama-3.1-8B-Instruct"
+        
     prompt = _patch_padding_space(tokenizer_id, prompt)
     # Jiayi: Patch ends here
 
