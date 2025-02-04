@@ -90,8 +90,10 @@ def new_execute_model(
             lmcache_compactor.compact_memory(
                 model_input_subset,
                 kv_caches,
-                compactor_input.dst_slot_mappings)
-            
+                compactor_input.dst_slot_mappings,
+                compactor_input.preempt_seq_id)
+            compactor_input.preempt_seq_id = [] 
+
             # LMCache memory compaction (move kv cache)
             lmcache_compactor.clean_request_states(
                 compactor_input.end_seq_ids,

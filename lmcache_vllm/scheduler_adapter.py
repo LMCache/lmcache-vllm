@@ -134,7 +134,7 @@ def new_scheduler__init__(
         compacted_indices_dict={})
     
     self.compactor_input = CompactorInput(
-        dst_slot_mappings={}, end_seq_ids=[])
+        dst_slot_mappings={}, end_seq_ids=[], preempt_seq_id=[])
     # Jiayi Modification ends
 
 
@@ -267,6 +267,9 @@ def _new_schedule_running(
             if do_preempt:
                 preempted_mode = self._preempt(victim_seq_group,
                                             blocks_to_swap_out)
+                # Qizheng
+                for seq in victim_seq_group.get_seqs():
+                    self.compactor_input.preempt_seq_id.append(seq.seq_id)
                 if preempted_mode == PreemptionMode.RECOMPUTE:
                     preempted.append(victim_seq_group)
                 else:
