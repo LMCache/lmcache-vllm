@@ -24,6 +24,7 @@ from lmcache_vllm.lmcache_utils import lmcache_get_config
 from lmcache_vllm.blend_adapter import attach_blend_prompt_indices, get_blend_separator, add_blend_indices
 
 from lmcache_vllm.models.llama import inject_llama
+from lmcache_vllm.models.qwen2 import inject_qwen2
 from lmcache_vllm.attention.flash_attn import inject_flash_attn
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.entrypoints.openai.serving_engine import AnyRequest, TextTokensPrompt
@@ -868,5 +869,6 @@ def InitLMCacheEnvironment() -> None:
     # Cacheblend
     if lmcache_get_config().enable_blending:
         inject_llama()
+        inject_qwen2()
         inject_flash_attn()
         inject_blend()
