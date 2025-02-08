@@ -20,6 +20,7 @@ from vllm.attention.backends.xformers import _get_seq_len_block_table_args
 import lmc_ops
 from lmcache.logging import init_logger
 from lmcache.compactor import LMCacheCompactorBuilder
+from lmcache_vllm.attention.prefix_prefill_compact import forward_prefix_expose
 import os
 
 logger = init_logger(__name__)
@@ -174,6 +175,7 @@ def xformers_forward_compact(
     if prefill_meta := attn_metadata.prefill_metadata:
         # Prompt run.
         if kv_cache is None or prefill_meta.block_tables.numel() == 0:
+            logger.info(f"prefill using normal attention {prefill_meta.block_tables.numel()}")
             # normal attention.
             # block tables are empty if the prompt does not have a cached
             # prefix.
@@ -182,6 +184,7 @@ def xformers_forward_compact(
             assert out.shape == output[:num_prefill_tokens].shape
             output[:num_prefill_tokens] = out
         else:
+            logger.info(f"prefill using paged attention {prefill_meta.block_tables.numel()}")
 
             assert prefill_meta.query_start_loc is not None
             assert prefill_meta.max_query_len is not None
@@ -190,7 +193,10 @@ def xformers_forward_compact(
             # TODO(Hai) this triton kernel has regression issue (broke) to
             # deal with different data types between KV and FP8 KV cache,
             # to be addressed separately.
-            out = PagedAttention.forward_prefix(
+            # logger.info('------------------------prefill_meta:')
+            # for k, v in prefill_meta.__dict__.items():
+            #     logger.info(f"\t{k}: {v}")
+            out, raw_qk = forward_prefix_expose(
                 query,
                 key,
                 value,
@@ -207,6 +213,31 @@ def xformers_forward_compact(
                 k_scale,
                 v_scale,
             )
+            print('=layer=')
+            torch.set_printoptions(profile='full')
+            # for head in probabilities[0]:
+            #     print(head[13])
+            print(raw_qk[0][10])
+            print(raw_qk[0][10].shape)
+            print(raw_qk.shape)
+
+            # out = PagedAttention.forward_prefix(
+            #     query,
+            #     key,
+            #     value,
+            #     self.kv_cache_dtype,
+            #     key_cache,
+            #     value_cache,
+            #     prefill_meta.block_tables,
+            #     prefill_meta.query_start_loc,
+            #     prefill_meta.seq_lens_tensor,
+            #     prefill_meta.context_lens_tensor,
+            #     prefill_meta.max_query_len,
+            #     self.alibi_slopes,
+            #     self.sliding_window,
+            #     k_scale,
+            #     v_scale,
+            # )
             assert output[:num_prefill_tokens].shape == out.shape
             output[:num_prefill_tokens] = out
 
@@ -230,6 +261,7 @@ def xformers_forward_compact(
             output_compact = torch.empty_like(decode_query)
             block_size = value_cache.shape[3]
             
+            # logger.info('decode using compact attention')
             lmc_ops.paged_attention_compact_v1(
                 logits_store,
                 output_compact,
