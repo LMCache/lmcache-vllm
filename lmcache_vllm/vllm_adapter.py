@@ -387,10 +387,10 @@ def lmcache_store_kv(
     else:
         start_layer = 0
 
-    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
+    # FIXME(Jiayi): ChatGLM does not have `model` or `end_layer`
     # How does PP work in this case?
     if hasattr(model_executable, "model") and \
-        hasattr(model_executable.model, "start_layer"):
+        hasattr(model_executable.model, "end_layer"):
         end_layer = model_executable.model.end_layer
     else:
         end_layer = len(kv_caches)
