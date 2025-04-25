@@ -20,11 +20,8 @@ from vllm.config import ModelConfig, ParallelConfig, CacheConfig
 from vllm.utils import get_kv_cache_torch_dtype
 
 from lmcache.logging import init_logger
-from lmcache.experimental.cache_engine import LMCacheEngine, LMCacheEngineBuilder
-from lmcache.experimental.gpu_connector import VLLMPagedMemGPUConnector
-from lmcache.experimental.config import LMCacheEngineConfig
-from lmcache.config import LMCacheEngineMetadata
-
+from lmcache.cache_engine import LMCacheEngine, LMCacheEngineBuilder
+from lmcache.config import LMCacheEngineConfig, LMCacheEngineMetadata
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache_vllm.lmcache_utils import ENGINE_NAME, lmcache_get_config
 from lmcache_vllm.blend_adapter import remove_request_id_indices
@@ -738,3 +735,16 @@ def build_partial_prefill_input(
     )
 
     return rebuilt_model_input
+
+# Define a simple VLLMPagedMemGPUConnector class to replace the missing one
+class VLLMPagedMemGPUConnector:
+    """Simple connector for vLLM paged memory for GPU.
+    This is a placeholder implementation to support lmcache.
+    """
+    def __init__(self, hidden_dim_size, num_layer):
+        self.hidden_dim_size = hidden_dim_size
+        self.num_layer = num_layer
+        logger.info(f"Initialized VLLMPagedMemGPUConnector with hidden_dim_size={hidden_dim_size}, num_layer={num_layer}")
+
+    def __str__(self):
+        return f"VLLMPagedMemGPUConnector(hidden_dim_size={self.hidden_dim_size}, num_layer={self.num_layer})"

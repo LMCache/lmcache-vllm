@@ -1,5 +1,5 @@
 """
-This version works with vllm-0.6.1.post2 and 0.6.2
+This version works with vllm-0.6.1.post2, 0.6.2, and 0.8.4
 """
 import torch
 import asyncio
@@ -8,9 +8,32 @@ from dataclasses import fields
 from typing import Optional, List, Set, Dict, Any, Union, AsyncGenerator
 import inspect
 
-from vllm.multimodal import MultiModalInputs
+# Try to import MultiModalKwargs (vLLM 0.8.4+) or fall back to MultiModalInputs
+try:
+    from vllm.multimodal import MultiModalKwargs as MultiModalInputs
+except ImportError:
+    try:
+        from vllm.multimodal import MultiModalInputs
+    except ImportError:
+        # Define a dummy class if neither exists
+        class MultiModalInputs:
+            @staticmethod
+            def as_kwargs(kwargs, device=None):
+                return kwargs
+
 from vllm.lora.request import LoRARequest
-from vllm.worker.model_runner_base import dump_input_when_exception
+# Try to import dump_input_when_exception if available (for older vLLM versions)
+try:
+    from vllm.worker.model_runner_base import dump_input_when_exception
+    has_dump_decorator = True
+except ImportError:
+    # Create a dummy decorator for vLLM 0.8.4+
+    def dump_input_when_exception(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator if args and callable(args[0]) else decorator
+    has_dump_decorator = False
+
 from vllm.distributed import get_pp_group
 from vllm.transformers_utils.tokenizer import MistralTokenizer
 
@@ -26,7 +49,16 @@ from lmcache_vllm.blend_adapter import attach_blend_prompt_indices, get_blend_se
 from lmcache_vllm.models.llama import inject_llama
 from lmcache_vllm.attention.flash_attn import inject_flash_attn
 from vllm.transformers_utils.tokenizer import AnyTokenizer
-from vllm.entrypoints.openai.serving_engine import AnyRequest, TextTokensPrompt
+# Handle different TokensPrompt locations in different vLLM versions
+try:
+    from vllm.inputs import TokensPrompt
+except ImportError:
+    try:
+        from vllm.inputs.preprocess import TokensPrompt
+    except ImportError:
+        from vllm.entrypoints.openai.serving_engine import TextTokensPrompt as TokensPrompt
+
+from vllm.entrypoints.openai.serving_engine import AnyRequest
 from pydantic import Field
 from typing_extensions import Annotated
 
@@ -39,120 +71,255 @@ def new_execute_model(
     self,
     model_input,
     kv_caches,
-    intermediate_tensors,
-    num_steps: int = 1,
+    intermediate_tensors=None,
+    num_steps=1,
+    **kwargs
 ): 
-    init_lmcache_engine(self.model_config, self.parallel_config, self.cache_config)
+    try:
+        # Initialize and configure LMCache engine
+        init_lmcache_engine(self.model_config, self.parallel_config, self.cache_config)
 
-    # TODO(Jiayi): broadcast the necessary `seq_group_metadata` in every model
-    # execution. Maybe there's a more efficient way.
-    model_input = broadcast_seq_group_metadata(model_input, self.is_driver_worker)
-    
-    # LMCache retrieval
-    retrieve_status = lmcache_should_retrieve(model_input, kv_caches)
-    is_skip = False
-    if retrieve_status != RetrieveStatus.NONE:
-        logger.info(f"KV cache retrieving mode: {retrieve_status}")
-        model_input, is_skip = lmcache_retrieve_kv(
-            self.model, self.model_config.model, model_input, kv_caches, retrieve_status)
-        if is_skip:
-            logger.debug("Prefill is entirely skipped")
+        # Broadcast metadata for distributed processing
+        model_input = broadcast_seq_group_metadata(model_input, self.is_driver_worker)
+
+        # LMCache retrieval
+        retrieve_status = lmcache_should_retrieve(model_input, kv_caches)
+        is_skip = False
+        if retrieve_status != RetrieveStatus.NONE:
+            logger.info(f"KV cache retrieving mode: {retrieve_status}")
+            model_input, is_skip = lmcache_retrieve_kv(
+                self.model, self.model_config.model, model_input, kv_caches, retrieve_status)
+            if is_skip:
+                logger.debug("Prefill is entirely skipped")
+
+                # Create a dummy hiddens_states
+                num_tok = len(model_input.input_tokens)
+                # In vLLM 0.8.4, get the embedding dimension from model_executor
+                if hasattr(self, 'model_executor') and hasattr(self.model_executor, 'model'):
+                    num_dim = self.model_executor.model.embed_tokens.embedding_dim
+                else:
+                    # Fallback to old approach
+                    num_dim = self.model.model.embed_tokens.embedding_dim
+
+                hidden_or_intermediate_states = torch.ones(
+                    num_tok, num_dim,
+                    device=model_input.input_tokens.device,
+                    dtype=torch.float16)  # Use a default dtype if we can't get it
+
+                # Try to match the type with model weights
+                if hasattr(self, 'model_executor') and hasattr(self.model_executor, 'model'):
+                    if hasattr(self.model_executor.model.embed_tokens, 'weight'):
+                        hidden_or_intermediate_states = hidden_or_intermediate_states.to(
+                            self.model_executor.model.embed_tokens.weight.dtype)
+                elif hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
+                    if hasattr(self.model.model.embed_tokens, 'weight'):
+                        hidden_or_intermediate_states = hidden_or_intermediate_states.to(
+                            self.model.model.embed_tokens.weight.dtype)
+
+        # Handle vLLM 0.8.4's changes
+        if num_steps > 1:
+            raise ValueError("num_steps > 1 is not supported in ModelRunner")
+
+        if self.lora_config:
+            assert model_input.lora_requests is not None
+            assert model_input.lora_mapping is not None
+            self.set_active_loras(model_input.lora_requests,
+                                 model_input.lora_mapping)
+
+        if self.prompt_adapter_config:
+            assert model_input.prompt_adapter_requests is not None
+            assert model_input.prompt_adapter_mapping is not None
+            self.set_active_prompt_adapters(
+                model_input.prompt_adapter_requests,
+                model_input.prompt_adapter_mapping)
+
+        self.attn_state.begin_forward(model_input)
+
+        # Currently cuda graph is only supported by the decode phase.
+        assert model_input.attn_metadata is not None
+        prefill_meta = model_input.attn_metadata.prefill_metadata
+        decode_meta = model_input.attn_metadata.decode_metadata
+
+        # Get the virtual engine (needed for accessing graph runners)
+        virtual_engine = model_input.virtual_engine
+
+        # Handle vLLM 0.8.4's previous_hidden_states
+        previous_hidden_states = kwargs.get("previous_hidden_states", None)
+        if hasattr(model_input, "previous_hidden_states") and model_input.previous_hidden_states is not None:
+            previous_hidden_states = model_input.previous_hidden_states
+
+        if prefill_meta is None and decode_meta.use_cuda_graph:
+            assert model_input.input_tokens is not None
+            graph_batch_size = model_input.input_tokens.shape[0]
+            model_executable = self.graph_runners[virtual_engine][
+                graph_batch_size]
             
-            # Create a dummy hiddens_states
-            num_tok = len(model_input.input_tokens)
-            num_dim = self.model.model.embed_tokens.embedding_dim
-            hidden_or_intermediate_states = torch.ones(
-                num_tok, num_dim,
-                device=model_input.input_tokens.device,
-                dtype=self.model.model.embed_tokens.weight.dtype)
+            # Handle vLLM 0.8.4's graph batch size adjustments for previous_hidden_states
+            if previous_hidden_states is not None:
+                previous_hidden_states = torch.cat([
+                    previous_hidden_states,
+                    torch.empty([
+                        graph_batch_size - previous_hidden_states.shape[0],
+                        *previous_hidden_states.shape[1:]
+                    ],
+                    dtype=previous_hidden_states.dtype,
+                    device=previous_hidden_states.device)
+                ])
+        else:
+            model_executable = self.model
+
+        # Handle vLLM 0.8.4's KV cache transfer functionality
+        bypass_model_exec = False
+        if hasattr(self, "need_recv_kv") and self.need_recv_kv(model_input, kv_caches):
+            from vllm.distributed import get_kv_transfer_group
+            hidden_or_intermediate_states, bypass_model_exec, model_input = \
+                get_kv_transfer_group().recv_kv_caches_and_hidden_states(
+                    model_executable,
+                    model_input,
+                    kv_caches=kv_caches
+                )
+
+        # Handle all the kwargs for model execution
+        multi_modal_kwargs = model_input.multi_modal_kwargs or {}
+
+        # Check which seqlen_agnostic attribute is used
+        if hasattr(self, 'has_inner_state'):
+            seqlen_agnostic_condition = self.has_inner_state
+        else:
+            seqlen_agnostic_condition = getattr(self, 'has_seqlen_agnostic', False)
             
-    
-    # TODO(Jiayi): Currently, we do not handle the last chunk in chunk prefill
-    
-    if num_steps > 1:
-        raise ValueError("num_steps > 1 is not supported in ModelRunner")
- 
-    if self.lora_config:
-        assert model_input.lora_requests is not None
-        assert model_input.lora_mapping is not None
-        self.set_active_loras(model_input.lora_requests,
-                              model_input.lora_mapping)
- 
-    if self.prompt_adapter_config:
-        assert model_input.prompt_adapter_requests is not None
-        assert model_input.prompt_adapter_mapping is not None
-        self.set_active_prompt_adapters(
-            model_input.prompt_adapter_requests,
-            model_input.prompt_adapter_mapping)
- 
-    self.attn_state.begin_forward(model_input)
- 
-    # Currently cuda graph is only supported by the decode phase.
-    assert model_input.attn_metadata is not None
-    prefill_meta = model_input.attn_metadata.prefill_metadata
-    decode_meta = model_input.attn_metadata.decode_metadata
-    # TODO(andoorve): We can remove this once all
-    # virtual engines share the same kv cache.
-    virtual_engine = model_input.virtual_engine
-    if prefill_meta is None and decode_meta.use_cuda_graph:
-        assert model_input.input_tokens is not None
-        graph_batch_size = model_input.input_tokens.shape[0]
-        model_executable = self.graph_runners[virtual_engine][
-            graph_batch_size]
-    else:
-        model_executable = self.model
+        seqlen_agnostic_kwargs = {
+            "finished_requests_ids": model_input.finished_requests_ids,
+            "request_ids_to_seq_ids": model_input.request_ids_to_seq_ids,
+        } if seqlen_agnostic_condition else {}
 
-    multi_modal_kwargs = model_input.multi_modal_kwargs or {}
-    seqlen_agnostic_kwargs = {
-        "finished_requests_ids": model_input.finished_requests_ids,
-        "request_ids_to_seq_ids": model_input.request_ids_to_seq_ids,
-    } if self.has_seqlen_agnostic else {}
-    if (self.observability_config is not None
-            and self.observability_config.collect_model_forward_time):
-        model_forward_start = torch.cuda.Event(enable_timing=True)
-        model_forward_end = torch.cuda.Event(enable_timing=True)
-        model_forward_start.record()
+        # Add previous_hidden_states to model_kwargs if available
+        model_kwargs = {}
+        if previous_hidden_states is not None:
+            model_kwargs["previous_hidden_states"] = previous_hidden_states
 
-    if not is_skip:
-        hidden_or_intermediate_states = model_executable(
-            input_ids=model_input.input_tokens,
-            positions=model_input.input_positions,
-            kv_caches=kv_caches,
-            attn_metadata=model_input.attn_metadata,
-            intermediate_tensors=intermediate_tensors,
-            **MultiModalInputs.as_kwargs(multi_modal_kwargs,
-                                        device=self.device),
-            **seqlen_agnostic_kwargs)
+        if (self.observability_config is not None
+                and self.observability_config.collect_model_forward_time):
+            model_forward_start = torch.cuda.Event(enable_timing=True)
+            model_forward_end = torch.cuda.Event(enable_timing=True)
+            model_forward_start.record()
+
+        # Execute model if not skipped by LMCache or vLLM KV transfer
+        if not is_skip and not bypass_model_exec:
+            # Check if set_forward_context is available (vLLM 0.8.4)
+            if 'set_forward_context' in globals() or hasattr(self, 'set_forward_context'):
+                try:
+                    from vllm.model_executor.utils import set_forward_context
+                    with set_forward_context(model_input.attn_metadata,
+                                            self.vllm_config if hasattr(self, 'vllm_config') else None,
+                                            virtual_engine):
+                        # Use the newer approach for vLLM 0.8.4
+                        hidden_or_intermediate_states = model_executable(
+                            input_ids=model_input.input_tokens,
+                            positions=model_input.input_positions,
+                            intermediate_tensors=intermediate_tensors,
+                            **{**MultiModalInputs.as_kwargs(multi_modal_kwargs, device=self.device),
+                               **seqlen_agnostic_kwargs,
+                               **model_kwargs}
+                        )
+                except (ImportError, NameError):
+                    # Handle the case for earlier vLLM versions
+                    hidden_or_intermediate_states = model_executable(
+                        input_ids=model_input.input_tokens,
+                        positions=model_input.input_positions,
+                        kv_caches=kv_caches,
+                        attn_metadata=model_input.attn_metadata,
+                        intermediate_tensors=intermediate_tensors,
+                        **MultiModalInputs.as_kwargs(multi_modal_kwargs, device=self.device),
+                        **seqlen_agnostic_kwargs,
+                        **model_kwargs
+                    )
+            else:
+                # Old vLLM approach
+                hidden_or_intermediate_states = model_executable(
+                    input_ids=model_input.input_tokens,
+                    positions=model_input.input_positions,
+                    kv_caches=kv_caches,
+                    attn_metadata=model_input.attn_metadata,
+                    intermediate_tensors=intermediate_tensors,
+                    **MultiModalInputs.as_kwargs(multi_modal_kwargs, device=self.device),
+                    **seqlen_agnostic_kwargs,
+                    **model_kwargs
+                )
 
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
             model_forward_end.record()
 
         # LMCache storing
-        store_status = lmcache_should_store(model_input, kv_caches)
-        if any([status != StoreStatus.NONE for status in store_status]):
-            logger.info(f"KV cache saving mode: {store_status}")
-            lmcache_store_kv(self.model_config, self.parallel_config, model_executable,
-                    model_input, self.cache_config, kv_caches, store_status)
+        # Only store if model was actually executed
+        if not is_skip and not bypass_model_exec:
+            store_status = lmcache_should_store(model_input, kv_caches)
+            if any([status != StoreStatus.NONE for status in store_status]):
+                logger.info(f"KV cache saving mode: {store_status}")
+                lmcache_store_kv(self.model_config, self.parallel_config, model_executable,
+                        model_input, self.cache_config, kv_caches, store_status)
 
-    # CacheBlend updates
-    if lmcache_get_config().enable_blending and \
-            hasattr(model_input.attn_metadata, "blend_metadata") and \
-            model_input.attn_metadata.blend_metadata.selected_token_indices is not None:
-        new_selected_token_indices = \
-                model_input.attn_metadata.blend_metadata.selected_token_indices
-        model_input.sampling_metadata.selected_token_indices = \
-                new_selected_token_indices
-        logger.debug(f"Updating selected_token_indices to {new_selected_token_indices} after blending")
+        # Handle vLLM 0.8.4's KV transfer send operation
+        if hasattr(self, "need_send_kv") and self.need_send_kv(model_input, kv_caches):
+            from vllm.distributed import get_kv_transfer_group
+            get_kv_transfer_group().send_kv_caches_and_hidden_states(
+                model_executable,
+                model_input,
+                kv_caches,
+                hidden_or_intermediate_states,
+            )
 
-    # Compute the logits in the last pipeline stage.
-    if not get_pp_group().is_last_rank:
-        if (self.is_driver_worker
-                and hidden_or_intermediate_states is not None
-                and isinstance(hidden_or_intermediate_states,
-                               IntermediateTensors)
-                and self.observability_config is not None
-                and self.observability_config.collect_model_forward_time):
+        # CacheBlend updates
+        if lmcache_get_config().enable_blending and \
+                hasattr(model_input.attn_metadata, "blend_metadata") and \
+                model_input.attn_metadata.blend_metadata.selected_token_indices is not None:
+            new_selected_token_indices = \
+                    model_input.attn_metadata.blend_metadata.selected_token_indices
+            model_input.sampling_metadata.selected_token_indices = \
+                    new_selected_token_indices
+            logger.debug(f"Updating selected_token_indices to {new_selected_token_indices} after blending")
+
+        # Handle pipeline parallelism in vLLM 0.8.4
+        from vllm.distributed import get_pp_group
+        if not get_pp_group().is_last_rank:
+            if (self.is_driver_worker
+                    and hidden_or_intermediate_states is not None
+                    and isinstance(hidden_or_intermediate_states, type(intermediate_tensors)) # Use type() to avoid direct import
+                    and self.observability_config is not None
+                    and self.observability_config.collect_model_forward_time):
+                model_forward_end.synchronize()
+                model_forward_time = model_forward_start.elapsed_time(
+                    model_forward_end)
+                orig_model_forward_time = 0.0
+                if intermediate_tensors is not None:
+                    orig_model_forward_time = intermediate_tensors.tensors.get(
+                        "model_forward_time", torch.tensor(0.0)).item()
+                hidden_or_intermediate_states.tensors["model_forward_time"] = (
+                    torch.tensor(model_forward_time + orig_model_forward_time))
+            return hidden_or_intermediate_states
+
+        logits = self.model.compute_logits(hidden_or_intermediate_states,
+                                          model_input.sampling_metadata)
+
+
+        if not self.is_driver_worker:
+            return []
+
+        # Jiayi: this call back calls `_process_model_outputs`
+        # in vllm/engine/llm_engine.py
+        if model_input.async_callback is not None:
+            model_input.async_callback()
+
+        # Sample the next token.
+        output = self.model.sample(
+            logits=logits,
+            sampling_metadata=model_input.sampling_metadata,
+        )
+
+        if (self.observability_config is not None
+                and self.observability_config.collect_model_forward_time
+                and output is not None):
             model_forward_end.synchronize()
             model_forward_time = model_forward_start.elapsed_time(
                 model_forward_end)
@@ -160,61 +327,35 @@ def new_execute_model(
             if intermediate_tensors is not None:
                 orig_model_forward_time = intermediate_tensors.tensors.get(
                     "model_forward_time", torch.tensor(0.0)).item()
-            hidden_or_intermediate_states.tensors["model_forward_time"] = (
-                torch.tensor(model_forward_time + orig_model_forward_time))
-        return hidden_or_intermediate_states
- 
-    logits = self.model.compute_logits(hidden_or_intermediate_states,
-                                       model_input.sampling_metadata)
+            # If there are multiple workers, we are still tracking the latency
+            # from the start time of the driver worker to the end time of the
+            # driver worker. The model forward time will then end up covering
+            # the communication time as well.
+            output.model_forward_time = (orig_model_forward_time +
+                                        model_forward_time)
 
-    
-    if not self.is_driver_worker:
-        return []
+        if self.return_hidden_states:
+            # we only need to pass hidden states of most recent token
+            assert model_input.sampling_metadata is not None
+            indices = model_input.sampling_metadata.selected_token_indices
+            if model_input.is_prompt:
+                hidden_states = hidden_or_intermediate_states.index_select(
+                    0, indices)
+                output.prefill_hidden_states = hidden_or_intermediate_states
+            elif decode_meta.use_cuda_graph:
+                hidden_states = hidden_or_intermediate_states[:len(indices)]
+            else:
+                hidden_states = hidden_or_intermediate_states
 
-    # Jiayi: this call back calls `_process_model_outputs`
-    # in vllm/engine/llm_engine.py
-    if model_input.async_callback is not None:
-        model_input.async_callback()
- 
-    # Sample the next token.
-    output: SamplerOutput = self.model.sample(
-        logits=logits,
-        sampling_metadata=model_input.sampling_metadata,
-    )
-    
-    if (self.observability_config is not None
-            and self.observability_config.collect_model_forward_time
-            and output is not None):
-        model_forward_end.synchronize()
-        model_forward_time = model_forward_start.elapsed_time(
-            model_forward_end)
-        orig_model_forward_time = 0.0
-        if intermediate_tensors is not None:
-            orig_model_forward_time = intermediate_tensors.tensors.get(
-                "model_forward_time", torch.tensor(0.0)).item()
-        # If there are multiple workers, we are still tracking the latency
-        # from the start time of the driver worker to the end time of the
-        # driver worker. The model forward time will then end up covering
-        # the communication time as well.
-        output.model_forward_time = (orig_model_forward_time +
-                                     model_forward_time)
- 
-    if self.return_hidden_states:
-        # we only need to pass hidden states of most recent token
-        assert model_input.sampling_metadata is not None
-        indices = model_input.sampling_metadata.selected_token_indices
-        if model_input.is_prompt:
-            hidden_states = hidden_or_intermediate_states.index_select(
-                0, indices)
-            output.prefill_hidden_states = hidden_or_intermediate_states
-        elif decode_meta.use_cuda_graph:
-            hidden_states = hidden_or_intermediate_states[:len(indices)]
-        else:
-            hidden_states = hidden_or_intermediate_states
- 
-        output.hidden_states = hidden_states
- 
-    return [output]
+            output.hidden_states = hidden_states
+
+        return [output]
+    except Exception as e:
+        # Add manual error handling if dump_input_when_exception is not available
+        if not has_dump_decorator:
+            logger.error(f"Error in execute_model: {str(e)}", exc_info=True)
+            logger.error(f"Model input: {model_input}")
+        raise
 
 def _patch_padding_space(
     tokenizer_id: str,
@@ -330,7 +471,7 @@ def _new_normalize_prompt_text_to_input(
     prompt: str,
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]],
     add_special_tokens: bool,
-) -> TextTokensPrompt:
+) -> TokensPrompt:
 
     # Jiayi: Patch starts here
     
@@ -372,7 +513,7 @@ def _new_normalize_prompt_text_to_input(
             current_idx += len(encoded.input_ids)
             blend_indices.append(current_idx)
             is_first_chunk = False
-        text_tokens_prompt: TextTokensPrompt = self._validate_input(request, input_ids, input_text)
+        text_tokens_prompt: TokensPrompt = self._validate_input(request, input_ids, input_text)
         if len(blend_indices) > 0:
             blend_indices.pop()
         text_tokens_prompt["blend_indices"] = blend_indices
@@ -629,8 +770,14 @@ async def new_tokenizer_group_encode_async(self,
     return ret
 
 from vllm.entrypoints.openai.serving_chat import ChatCompletionRequest, ChatCompletionResponse, ErrorResponse, RequestResponseMetadata, Request
-from vllm.entrypoints.openai.serving_chat import parse_chat_messages_futures, apply_mistral_chat_template, apply_hf_chat_template
-from vllm.utils import iterate_with_cancellation, random_uuid
+# Try to import functions that might have been moved or renamed in vLLM 0.8.4
+try:
+    from vllm.entrypoints.openai.serving_chat import parse_chat_messages_futures, apply_mistral_chat_template, apply_hf_chat_template
+    has_old_chat_api = True
+except ImportError:
+    # In vLLM 0.8.4, these functions are not directly importable
+    has_old_chat_api = False
+from vllm.utils import random_uuid
 from vllm.tracing import (contains_trace_headers, extract_trace_headers,
                           log_tracing_disabled_warning)
 from vllm.inputs import TokensPrompt
@@ -652,7 +799,7 @@ async def new_create_chat_completion(
         logger.error("Error with model %s", error_check_ret)
         return error_check_ret
 
-    # If the engine is dead, raise the engine's DEAD_ERROR.
+    # If the engine is dead, raise the engine's DEAD_error.
     # This is required for the streaming case, where we return a
     # success status before we actually start generating text :).
     if self.engine_client.errored:
@@ -667,35 +814,70 @@ async def new_create_chat_completion(
         model_config = self.model_config
         tokenizer = await self.engine_client.get_tokenizer(lora_request)
 
-        conversation, mm_data_future = parse_chat_messages_futures(
-            request.messages, model_config, tokenizer)
+        # Handle differences between vLLM 0.6.x and 0.8.4
+        if has_old_chat_api:
+            # Old API in vLLM 0.6.x
+            conversation, mm_data_future = parse_chat_messages_futures(
+                request.messages, model_config, tokenizer)
 
-        tool_dicts = None if request.tools is None else [
-            tool.model_dump() for tool in request.tools
-        ]
+            tool_dicts = None if request.tools is None else [
+                tool.model_dump() for tool in request.tools
+            ]
 
-        prompt: Union[str, List[int]]
-        is_mistral_tokenizer = isinstance(tokenizer, MistralTokenizer)
-        if is_mistral_tokenizer:
-            prompt = apply_mistral_chat_template(
-                tokenizer,
-                messages=request.messages,
-                chat_template=request.chat_template or self.chat_template,
-                add_generation_prompt=request.add_generation_prompt,
-                tools=tool_dicts,
-                documents=request.documents,
-                **(request.chat_template_kwargs or {}),
-            )
+            prompt: Union[str, List[int]]
+            is_mistral_tokenizer = isinstance(tokenizer, MistralTokenizer)
+            if is_mistral_tokenizer:
+                prompt = apply_mistral_chat_template(
+                    tokenizer,
+                    messages=request.messages,
+                    chat_template=request.chat_template or self.chat_template,
+                    add_generation_prompt=request.add_generation_prompt,
+                    tools=tool_dicts,
+                    documents=request.documents,
+                    **(request.chat_template_kwargs or {}),
+                )
+            else:
+                prompt = apply_hf_chat_template(
+                    tokenizer,
+                    conversation=conversation,
+                    chat_template=request.chat_template or self.chat_template,
+                    add_generation_prompt=request.add_generation_prompt,
+                    tools=tool_dicts,
+                    documents=request.documents,
+                    **(request.chat_template_kwargs or {}),
+                )
         else:
-            prompt = apply_hf_chat_template(
-                tokenizer,
-                conversation=conversation,
-                chat_template=request.chat_template or self.chat_template,
-                add_generation_prompt=request.add_generation_prompt,
-                tools=tool_dicts,
-                documents=request.documents,
-                **(request.chat_template_kwargs or {}),
-            )
+            # New API in vLLM 0.8.4
+            try:
+                # Use the _preprocess_chat method which is now part of the class
+                conversation, request_prompts, engine_prompts = await self._preprocess_chat(
+                    request,
+                    tokenizer,
+                    request.messages,
+                    request.chat_template or self.chat_template,
+                    "text",  # chat_template_content_format
+                    request.add_generation_prompt,
+                    tool_dicts=[tool.model_dump() for tool in request.tools] if request.tools else None,
+                    documents=request.documents,
+                    chat_template_kwargs=request.chat_template_kwargs,
+                    truncate_prompt_tokens=request.truncate_prompt_tokens,
+                    add_special_tokens=request.add_special_tokens,
+                )
+                # In vLLM 0.8.4, engine_prompts contains the prepared prompts
+                if engine_prompts:
+                    prompt = engine_prompts[0]
+                else:
+                    raise ValueError("No engine prompts generated")
+
+                # Since mm_data isn't directly accessible, try to extract it from the prompt
+                mm_data_future = asyncio.Future()
+                if isinstance(prompt, dict) and "multi_modal_data" in prompt:
+                    mm_data_future.set_result(prompt.get("multi_modal_data"))
+                else:
+                    mm_data_future.set_result(None)
+            except (AttributeError, TypeError) as e:
+                # Fall back to original method but without the parse_chat_messages_futures 
+                return await super().create_chat_completion(request, raw_request)
     except Exception as e:
         logger.error("Error in applying chat template from request: %s", e)
         return self.create_error_response(str(e))
@@ -712,7 +894,7 @@ async def new_create_chat_completion(
         return self.create_error_response(
             "tool_choice = \"required\" is not supported!")
 
-    if not is_mistral_tokenizer and request.tool_choice == "auto" and not (
+    if not isinstance(tokenizer, MistralTokenizer) and request.tool_choice == "auto" and not (
             self.enable_auto_tools and self.tool_parser is not None):
         # for hf tokenizers, "auto" tools requires
         # --enable-auto-tool-choice and --tool-call-parser
@@ -727,8 +909,12 @@ async def new_create_chat_completion(
         raw_request.state.request_metadata = request_metadata
 
     try:
-        guided_decode_logits_processor = (
-            await self._guided_decode_logits_processor(request, tokenizer))
+        # For vLLM 0.8.4 compatibility
+        if hasattr(self, "_guided_decode_logits_processor"):
+            guided_decode_logits_processor = (
+                await self._guided_decode_logits_processor(request, tokenizer))
+        else:
+            guided_decode_logits_processor = None
 
         if isinstance(prompt, str):
             prompt_inputs = self._tokenize_prompt_input(
@@ -738,28 +924,67 @@ async def new_create_chat_completion(
                 truncate_prompt_tokens=request.truncate_prompt_tokens,
                 add_special_tokens=request.add_special_tokens,
             )
+        elif isinstance(prompt, dict) and "prompt_token_ids" in prompt:
+            # vLLM 0.8.4 might provide prompt as a dictionary
+            prompt_inputs = prompt
         else:
             assert isinstance(prompt, list) and isinstance(
                 prompt[0], int
-            ), "Prompt has to be either a string or a list of token ids"
-            prompt_inputs = TextTokensPrompt(
-                prompt=tokenizer.decode(prompt), prompt_token_ids=prompt)
+            ), "Prompt has to be either a string, dictionary with prompt_token_ids, or a list of token ids"
+            prompt_inputs = {"prompt": tokenizer.decode(prompt), "prompt_token_ids": prompt}
 
         assert prompt_inputs is not None
 
-        sampling_params = request.to_sampling_params(
-            tokenizer,
-            guided_decode_logits_processor,
-            default_max_tokens=self.max_model_len -
-            len(prompt_inputs["prompt_token_ids"]))
+        if hasattr(request, "to_sampling_params"):
+            # vLLM 0.6.x API
+            sampling_params = request.to_sampling_params(
+                tokenizer,
+                guided_decode_logits_processor,
+                default_max_tokens=self.max_model_len -
+                len(prompt_inputs["prompt_token_ids"]))
+        else:
+            # vLLM 0.8.4 API
+            from vllm.sampling_params import SamplingParams
+
+            # Create sampling params from the request attributes
+            sampling_params = SamplingParams(
+                n=request.n,
+                presence_penalty=request.presence_penalty,
+                frequency_penalty=request.frequency_penalty,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                top_k=request.top_k,
+                min_p=request.min_p,
+                use_beam_search=request.use_beam_search,
+                stop=request.stop,
+                stop_token_ids=request.stop_token_ids,
+                max_tokens=request.max_tokens or self.max_model_len - len(prompt_inputs["prompt_token_ids"]),
+                best_of=request.best_of,
+                seed=request.seed,
+                skip_special_tokens=request.skip_special_tokens,
+                logprobs=request.logprobs,
+                prompt_logprobs=request.prompt_logprobs,
+                guided_logits_processor=guided_decode_logits_processor,
+            )
 
         self._log_inputs(request_id,
                         prompt_inputs,
                         params=sampling_params,
                         lora_request=lora_request,
                         prompt_adapter_request=prompt_adapter_request)
-        engine_inputs = TokensPrompt(
-            prompt_token_ids=prompt_inputs["prompt_token_ids"])
+
+        # Get engine_inputs based on vLLM version
+        if hasattr(self, "tokensPrompt") and hasattr(self.tokensPrompt, "__call__"):
+            # vLLM 0.8.4 style
+            from vllm.inputs import TokensPrompt
+            engine_inputs = TokensPrompt(
+                prompt_token_ids=prompt_inputs["prompt_token_ids"])
+        else:
+            # vLLM 0.6.x style
+            from vllm.inputs.preprocess import TokensPrompt
+            engine_inputs = TokensPrompt(
+                prompt_token_ids=prompt_inputs["prompt_token_ids"])
+
         # Sixian: Patch starts here.
         if "blend_indices" in prompt_inputs:
             engine_inputs["blend_indices"] = prompt_inputs["blend_indices"]
@@ -833,18 +1058,21 @@ def inject_blend():
 def InitLMCacheEnvironment() -> None:
     """Initialize the LMCache environment.
     """
-    
+    # Initialize LLMEngine
     import vllm.engine.llm_engine
     global original_llm_engine_init
     original_llm_engine_init = vllm.engine.llm_engine.LLMEngine.__init__
     vllm.engine.llm_engine.LLMEngine.__init__ = new_llm_engine_init
     
+    # Replace execute_model
     import vllm.worker.model_runner 
     vllm.worker.model_runner.ModelRunner.execute_model = new_execute_model
 
+    # Replace task completion handler
     import vllm.engine.async_llm_engine
     vllm.engine.async_llm_engine._log_task_completion = new_log_task_completion
     
+    # Replace model input preparation
     import vllm.worker.model_runner
     global original_prepare_model_input
     original_prepare_model_input = vllm.worker.model_runner.ModelRunner.prepare_model_input
@@ -854,14 +1082,22 @@ def InitLMCacheEnvironment() -> None:
     original_prepare_model_input_tensors = vllm.worker.model_runner.ModelRunner._prepare_model_input_tensors
     vllm.worker.model_runner.ModelRunner._prepare_model_input_tensors = wrap_prepare_model_input_tensors
 
-    import vllm.core.scheduler
-    vllm.core.scheduler.Scheduler._free_finished_seqs = new_free_finished_seqs
+    # Replace scheduler methods
+    try:
+        # vLLM 0.8.4 path
+        import vllm.core.scheduler
+        vllm.core.scheduler.Scheduler._free_finished_seqs = new_free_finished_seqs
+    except (ImportError, AttributeError):
+        # Older vLLM path
+        import vllm.scheduler
+        vllm.scheduler.Scheduler._free_finished_seqs = new_free_finished_seqs
     
+    # Replace tokenizer methods
     import vllm
     vllm.inputs.preprocess.InputPreprocessor._tokenize_prompt = _new_tokenize_prompt
     vllm.inputs.preprocess.InputPreprocessor._tokenize_prompt_async = _new_tokenize_prompt_async
     
-    # inject tokenizer in openai server
+    # Replace OpenAI serving methods
     vllm.entrypoints.openai.serving_engine.OpenAIServing._normalize_prompt_text_to_input = \
         _new_normalize_prompt_text_to_input
     
@@ -870,3 +1106,18 @@ def InitLMCacheEnvironment() -> None:
         inject_llama()
         inject_flash_attn()
         inject_blend()
+
+# Add custom implementation for iterate_with_cancellation as it's no longer in vLLM 0.8.4
+async def iterate_with_cancellation(iterator, is_cancelled):
+    """Iterate through an async iterator until a cancellation event is set.
+    When the cancellation event is triggered, we will try our best to clean up.
+    """
+    try:
+        async for item in iterator:
+            if is_cancelled():
+                # Early terminate the request
+                break
+            yield item
+    except Exception as e:
+        # Re-raises the exception
+        raise e

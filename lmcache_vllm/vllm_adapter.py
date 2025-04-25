@@ -65,23 +65,43 @@ def create_model_input_subset(
     model_name: str,
     model_executable: "ModelInputForGPUWithSamplingMetadata",
 ) -> ModelInputSubset:
+    # In vLLM 0.8.4, the model structure has changed
+    # We need to carefully extract the layers based on the model type
     if model_name in SUPPORTED_MODELS.llama_family or \
         model_name in SUPPORTED_MODELS.mistral_family:
-        model = model_executable.model
-        model_layers = model.layers
-        attn_layers = [layer.self_attn for layer in model_layers]
+        # In vLLM 0.8.4, model_executable doesn't have direct model attribute
+        # We need to access the model through executor
+        try:
+            # First try to access through model_executor
+            model = model_executable.model_executor.model
+            model_layers = model.layers
+            attn_layers = [layer.self_attn for layer in model_layers]
+        except AttributeError:
+            # Fallback to original approach
+            model = model_executable.model
+            model_layers = model.layers
+            attn_layers = [layer.self_attn for layer in model_layers]
     elif model_name in SUPPORTED_MODELS.glm_family:
-        model = model_executable.transformer
-        model_layers = model.encoder.layers
-        attn_layers = [layer.self_attention for layer in model_layers]
+        try:
+            model = model_executable.model_executor.model
+            model_layers = model.encoder.layers
+            attn_layers = [layer.self_attention for layer in model_layers]
+        except AttributeError:
+            model = model_executable.transformer
+            model_layers = model.encoder.layers
+            attn_layers = [layer.self_attention for layer in model_layers]
     else:
-        # FIXME(Jiayi): `else` is the default setting, which could be wrong
-        model = model_executable.model
-        model_layers = model.layers
-        attn_layers = [layer.self_attn for layer in model_layers]
+        # Fallback default setting
+        try:
+            model = model_executable.model_executor.model
+            model_layers = model.layers
+            attn_layers = [layer.self_attn for layer in model_layers]
+        except AttributeError:
+            model = model_executable.model
+            model_layers = model.layers
+            attn_layers = [layer.self_attn for layer in model_layers]
     
-    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
-    # How does PP work in this case?
+    # Check for start_layer and end_layer attributes
     if hasattr(model, "start_layer"):
         start_layer = model.start_layer
     else:
@@ -378,21 +398,35 @@ def lmcache_store_kv(
     assert engine is not None, "LMCache engine is not initialized."
 
     seq_lens = model_input.attn_metadata.seq_lens
-        
-    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
-    # How does PP work in this case?
-    if hasattr(model_executable, "model") and \
-        hasattr(model_executable.model, "start_layer"):
-        start_layer = model_executable.model.start_layer
-    else:
+    
+    # In vLLM 0.8.4, model structure might have changed
+    # Try to access the start_layer and end_layer attributes
+    try:
+        # First try to access through model_executor.model
+        if hasattr(model_executable, "model_executor") and hasattr(model_executable.model_executor, "model"):
+            model = model_executable.model_executor.model
+            if hasattr(model, "start_layer"):
+                start_layer = model.start_layer
+            else:
+                start_layer = 0
+            
+            if hasattr(model, "end_layer"):
+                end_layer = model.end_layer
+            else:
+                end_layer = len(kv_caches)
+        else:
+            # Fallback to original approach
+            if hasattr(model_executable, "model") and hasattr(model_executable.model, "start_layer"):
+                start_layer = model_executable.model.start_layer
+            else:
+                start_layer = 0
+            
+            if hasattr(model_executable, "model") and hasattr(model_executable.model, "end_layer"):
+                end_layer = model_executable.model.end_layer
+            else:
+                end_layer = len(kv_caches)
+    except AttributeError:
         start_layer = 0
-
-    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
-    # How does PP work in this case?
-    if hasattr(model_executable, "model") and \
-        hasattr(model_executable.model, "start_layer"):
-        end_layer = model_executable.model.end_layer
-    else:
         end_layer = len(kv_caches)
 
     # For Turing GPU
@@ -592,15 +626,30 @@ def lmcache_retrieve_kv(
                 kv_cache = kv_caches[layer_idx]
                 attn_layer = attn_layers[i]
                 key_cache, value_cache = kv_cache[0], kv_cache[1]
+                
+                # vLLM 0.8.4 might have different structure
+                # Check and adapt to the attn_layer structure
+                if hasattr(attn_layer, 'attn'):
+                    # Original structure
+                    cache_dtype = getattr(attn_layer.attn, 'kv_cache_dtype', None)
+                    k_scale = getattr(attn_layer.attn, '_k_scale', None)
+                    v_scale = getattr(attn_layer.attn, '_v_scale', None)
+                else:
+                    # New structure in vLLM 0.8.4
+                    cache_dtype = getattr(attn_layer, 'kv_cache_dtype', None)
+                    k_scale = getattr(attn_layer, '_k_scale', None) 
+                    v_scale = getattr(attn_layer, '_v_scale', None)
+                
+                # Fallback to None if attributes not found
                 ops.reshape_and_cache_flash(
                     kv_tuple[layer_idx][0].to(key_cache.device),
                     kv_tuple[layer_idx][1].to(value_cache.device),
                     key_cache,
                     value_cache,
                     slot_mapping[start_pos:start_pos + lmc_num_computed_tokens],
-                    attn_layer.attn.kv_cache_dtype,
-                    attn_layer.attn._k_scale,
-                    attn_layer.attn._v_scale,
+                    cache_dtype,
+                    k_scale,
+                    v_scale,
                 )
             
             idx += 1
@@ -743,9 +792,18 @@ def build_partial_prefill_input(
     # import here to avoid circular import.
     from vllm.worker.model_runner import (
         ModelInputForGPUWithSamplingMetadata)
+    
+    # In vLLM 0.8.4, ModelInputForGPUWithSamplingMetadata constructor may have new parameters
+    # Check if token_types is in the current model_input
+    token_types = getattr(model_input, 'token_types', None)
+    previous_hidden_states = getattr(model_input, 'previous_hidden_states', None)
+    scheduler_outputs = getattr(model_input, 'scheduler_outputs', None)
+    
+    # Create with args that exist in both old and new versions
     rebuilt_model_input = ModelInputForGPUWithSamplingMetadata(
         input_tokens=torch.cat(rebuilt_input_tokens).to(device),
         input_positions=torch.cat(rebuilt_input_positions).to(device),
+        token_types=token_types,
         seq_lens=model_input.seq_lens,
         query_lens=rebuilt_query_lens,
         lora_mapping=model_input.lora_mapping,
@@ -760,6 +818,8 @@ def build_partial_prefill_input(
         sampling_metadata=rebuilt_sampling_metadata,
         is_prompt=model_input.is_prompt,
         async_callback=model_input.async_callback,
+        scheduler_outputs=scheduler_outputs,
+        previous_hidden_states=previous_hidden_states,
         seq_group_metadata_list=seq_group_metadata_list
     )
 
