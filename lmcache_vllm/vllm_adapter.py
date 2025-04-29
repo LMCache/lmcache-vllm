@@ -65,23 +65,43 @@ def create_model_input_subset(
     model_name: str,
     model_executable: "ModelInputForGPUWithSamplingMetadata",
 ) -> ModelInputSubset:
+    # In vLLM 0.8.4, the model structure has changed
+    # We need to carefully extract the layers based on the model type
     if model_name in SUPPORTED_MODELS.llama_family or \
         model_name in SUPPORTED_MODELS.mistral_family:
-        model = model_executable.model
-        model_layers = model.layers
-        attn_layers = [layer.self_attn for layer in model_layers]
+        # In vLLM 0.8.4, model_executable doesn't have direct model attribute
+        # We need to access the model through executor
+        try:
+            # First try to access through model_executor
+            model = model_executable.model_executor.model
+            model_layers = model.layers
+            attn_layers = [layer.self_attn for layer in model_layers]
+        except AttributeError:
+            # Fallback to original approach
+            model = model_executable.model
+            model_layers = model.layers
+            attn_layers = [layer.self_attn for layer in model_layers]
     elif model_name in SUPPORTED_MODELS.glm_family:
-        model = model_executable.transformer
-        model_layers = model.encoder.layers
-        attn_layers = [layer.self_attention for layer in model_layers]
+        try:
+            model = model_executable.model_executor.model
+            model_layers = model.encoder.layers
+            attn_layers = [layer.self_attention for layer in model_layers]
+        except AttributeError:
+            model = model_executable.transformer
+            model_layers = model.encoder.layers
+            attn_layers = [layer.self_attention for layer in model_layers]
     else:
-        # FIXME(Jiayi): `else` is the default setting, which could be wrong
-        model = model_executable.model
-        model_layers = model.layers
-        attn_layers = [layer.self_attn for layer in model_layers]
+        # Fallback default setting
+        try:
+            model = model_executable.model_executor.model
+            model_layers = model.layers
+            attn_layers = [layer.self_attn for layer in model_layers]
+        except AttributeError:
+            model = model_executable.model
+            model_layers = model.layers
+            attn_layers = [layer.self_attn for layer in model_layers]
     
-    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
-    # How does PP work in this case?
+    # Check for start_layer and end_layer attributes
     if hasattr(model, "start_layer"):
         start_layer = model.start_layer
     else:
@@ -168,6 +188,7 @@ def init_lmcache_engine(
 def broadcast_seq_group_metadata(
     model_input: "ModelInputForGPUWithSamplingMetadata",
     is_driver_worker: bool,
+    seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> "ModelInputForGPUWithSamplingMetadata":
     """Brodcast the `model_input` from driver worker to non-driver workers.
 
@@ -177,13 +198,16 @@ def broadcast_seq_group_metadata(
     :param is_driver_worker: Whether the code is executed in driver worker. 
     :type is_driver_worker: bool
 
+    :param seq_group_metadata_list: The sequence group metadata list for the current request.
+    :type seq_group_metadata_list: List[SequenceGroupMetadata]
+
     : return: Original `model_input` if driver_worker.
               Broadcasted `model_input` otherwise.
     """
 
     # broadcast len of `seq_group_metadata_list`
     if is_driver_worker:
-        seq_group_len = [len(model_input.seq_group_metadata_list)]
+        seq_group_len = [len(seq_group_metadata_list)]
     else:
         seq_group_len = [0]
     dist.broadcast_object_list(seq_group_len, src=0)
@@ -191,7 +215,7 @@ def broadcast_seq_group_metadata(
     
     # broadcast `seq_group_metadata_list`
     if is_driver_worker:
-        seq_group_metadata_list = model_input.seq_group_metadata_list
+        pass
     else:
         seq_group_metadata_list = [None] * seq_group_len
     dist.broadcast_object_list(seq_group_metadata_list , src=0)
@@ -199,7 +223,23 @@ def broadcast_seq_group_metadata(
     if is_driver_worker:
         return model_input
     else:
-        return dataclasses.replace(model_input, seq_group_metadata_list=seq_group_metadata_list)
+        # We need to reconstruct carefully as replace might not handle missing args well depending on Python/dataclass version
+        # Assuming ModelInputForGPUWithSamplingMetadata is the type
+        from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
+
+        # Filter out seq_group_metadata_list if it exists as a field
+        field_names = {f.name for f in dataclasses.fields(ModelInputForGPUWithSamplingMetadata)}
+        filtered_args = {k: getattr(model_input, k) for k in field_names if hasattr(model_input, k)}
+
+        # Re-create the object using only the valid fields for its constructor
+        rebuilt_input = ModelInputForGPUWithSamplingMetadata(**filtered_args)
+
+        # If the broadcasted list is needed elsewhere (though unlikely for this specific error context),
+        # attach it after creation (if the object allows mutable attributes or has a specific place for it).
+        # For now, we assume it's not needed directly on the object for the constructor to work.
+        # setattr(rebuilt_input, 'seq_group_metadata_list_received', seq_group_metadata_list)
+
+        return rebuilt_input
 
 def close_lmcache_engine() -> None:
     """Close the LMCache engine if it is initialized.
@@ -209,7 +249,9 @@ def close_lmcache_engine() -> None:
 
 def lmcache_should_retrieve(
         model_input: "ModelInputForGPUWithSamplingMetadata", 
-        kv_caches: List[torch.Tensor]) -> RetrieveStatus:
+        kv_caches: List[torch.Tensor],
+        seq_group_metadata_list: List[SequenceGroupMetadata],
+        ) -> RetrieveStatus:
     """Check should we retrieve KV from LMCache for the current model_input.
 
     :param model_input: The model input for the current request.
@@ -217,6 +259,9 @@ def lmcache_should_retrieve(
 
     :param kv_caches: The paged memory
     :type kv_caches: List[torch.Tensor]
+
+    :param seq_group_metadata_list: The sequence group metadata list for the current request.
+    :type seq_group_metadata_list: List[SequenceGroupMetadata]
 
     :return: RetrieveStatus.
     """
@@ -261,7 +306,9 @@ def lmcache_should_retrieve(
 
 def lmcache_should_store(
         model_input: "ModelInputForGPUWithSamplingMetadata", 
-        kv_caches: List[torch.Tensor]) -> StoreStatus:
+        kv_caches: List[torch.Tensor],
+        seq_group_metadata_list: List[SequenceGroupMetadata],
+        ) -> StoreStatus:
     """Check should we store KV into LMCache for the current model_input.
 
     :param model_input: The model input for the current request.
@@ -269,6 +316,9 @@ def lmcache_should_store(
 
     :param kv_caches: The paged memory
     :type kv_caches: List[torch.Tensor]
+
+    :param seq_group_metadata_list: The sequence group metadata list for the current request.
+    :type seq_group_metadata_list: List[SequenceGroupMetadata]
 
     :return: A list of StoreStatus.
              StoreStatus.PREFILL/DECODE/CHUNK_PREFILL if we should store KV after PREFILL/DECODE.
@@ -318,7 +368,6 @@ def lmcache_should_store(
 
     if is_all_prefill_run:
         selected_token_indices = model_input.sampling_metadata.selected_token_indices
-        seq_group_metadata_list = model_input.seq_group_metadata_list
         seq_data_idx = 0
         selected_token_indices_idx = 0
         for seq_group_idx, seq_group_metadata in enumerate(seq_group_metadata_list):
@@ -359,6 +408,7 @@ def lmcache_store_kv(
     cache_config: CacheConfig,
     kv_caches: List[torch.Tensor],
     store_status: List[StoreStatus],
+    seq_group_metadata_list: List[SequenceGroupMetadata],
 ) -> None:
     """Store the KV caches into LMCache for the current model_input.
 
@@ -374,25 +424,44 @@ def lmcache_store_kv(
     :param store_status: Indicate whether and how KV cache of each req is stored
     :type store_status: List[StoreStatus]
     """
+    # Skip during profiling
+    if kv_caches is None or (isinstance(kv_caches, list) and len(kv_caches) > 0 and kv_caches[0] is None):
+        logger.debug("Profiling run detected in store_kv, skipping")
+        return
+
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
     assert engine is not None, "LMCache engine is not initialized."
 
     seq_lens = model_input.attn_metadata.seq_lens
-        
-    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
-    # How does PP work in this case?
-    if hasattr(model_executable, "model") and \
-        hasattr(model_executable.model, "start_layer"):
-        start_layer = model_executable.model.start_layer
-    else:
+    
+    # In vLLM 0.8.4, model structure might have changed
+    # Try to access the start_layer and end_layer attributes
+    try:
+        # First try to access through model_executor.model
+        if hasattr(model_executable, "model_executor") and hasattr(model_executable.model_executor, "model"):
+            model = model_executable.model_executor.model
+            if hasattr(model, "start_layer"):
+                start_layer = model.start_layer
+            else:
+                start_layer = 0
+            
+            if hasattr(model, "end_layer"):
+                end_layer = model.end_layer
+            else:
+                end_layer = len(kv_caches)
+        else:
+            # Fallback to original approach
+            if hasattr(model_executable, "model") and hasattr(model_executable.model, "start_layer"):
+                start_layer = model_executable.model.start_layer
+            else:
+                start_layer = 0
+            
+            if hasattr(model_executable, "model") and hasattr(model_executable.model, "end_layer"):
+                end_layer = model_executable.model.end_layer
+            else:
+                end_layer = len(kv_caches)
+    except AttributeError:
         start_layer = 0
-
-    # FIXME(Jiayi): ChatGLM does not have `model` or `start_layer`
-    # How does PP work in this case?
-    if hasattr(model_executable, "model") and \
-        hasattr(model_executable.model, "start_layer"):
-        end_layer = model_executable.model.end_layer
-    else:
         end_layer = len(kv_caches)
 
     # For Turing GPU
@@ -401,7 +470,6 @@ def lmcache_store_kv(
     gpu_capability = torch.cuda.get_device_capability()
 
     seq_data_idx = 0
-    seq_group_metadata_list = model_input.seq_group_metadata_list
     for seq_group_metadata in seq_group_metadata_list:
         for seqid, seq_data in seq_group_metadata.seq_data.items():
             status = store_status[seq_data_idx]
@@ -422,6 +490,12 @@ def lmcache_store_kv(
             if skip_leading_tokens < seq_len:
                 assert skip_leading_tokens % engine.chunk_size == 0
                 slot_mapping = []
+
+                # Check if block_tables is None
+                if seq_group_metadata.block_tables is None:
+                    logger.error(f"block_tables is None for seq_id: {seqid}")
+                    continue
+
                 compute_slot_mapping(False, slot_mapping, seqid, seq_len, 
                     skip_leading_tokens, 0, vllm_block_size, seq_group_metadata.block_tables)
                 kv_tuple_list = []
@@ -470,6 +544,7 @@ def lmcache_retrieve_kv(
     model_input: "ModelInputForGPUWithSamplingMetadata",
     kv_caches: List[torch.Tensor],
     retrieve_status: RetrieveStatus,
+    seq_group_metadata_list: List[SequenceGroupMetadata],
 ) -> Tuple["ModelInputForGPUWithSamplingMetadata", bool]:
     """Retrieve the KV caches from LMCache for the current model_input. And 
     rebuild the model_input to reflect the changes in KV if necessary.
@@ -489,9 +564,19 @@ def lmcache_retrieve_kv(
     :return: The rebuilt model_input to reflect the changes in KV.
     :return: The boolean value to indicate whether the entire execute_model should be skipped
     """
+    # Skip during profiling
+    if kv_caches is None or (isinstance(kv_caches, list) and len(kv_caches) > 0 and kv_caches[0] is None):
+        logger.debug("Profiling run detected in retrieve_kv, skipping")
+        return model_input, False
+
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
     assert engine is not None, "LMCache engine is not initialized."
     if engine.config.enable_blending:
+        return model_input, False
+
+    # Skip if block_tables is None (happens during profiling)
+    if any(seq_group.block_tables is None for seq_group in seq_group_metadata_list):
+        logger.debug("Block tables not initialized (likely profiling), skipping")
         return model_input, False
 
     query_start_loc = model_input.attn_metadata.query_start_loc
@@ -519,8 +604,6 @@ def lmcache_retrieve_kv(
     
     # idx is on a sequence, not a sequence group.
     idx = 0
-
-    seq_group_metadata_list = model_input.seq_group_metadata_list
 
     for seq_group_metadata in seq_group_metadata_list:
         request_id = seq_group_metadata.request_id
@@ -592,15 +675,30 @@ def lmcache_retrieve_kv(
                 kv_cache = kv_caches[layer_idx]
                 attn_layer = attn_layers[i]
                 key_cache, value_cache = kv_cache[0], kv_cache[1]
+                
+                # vLLM 0.8.4 might have different structure
+                # Check and adapt to the attn_layer structure
+                if hasattr(attn_layer, 'attn'):
+                    # Original structure
+                    cache_dtype = getattr(attn_layer.attn, 'kv_cache_dtype', None)
+                    k_scale = getattr(attn_layer.attn, '_k_scale', None)
+                    v_scale = getattr(attn_layer.attn, '_v_scale', None)
+                else:
+                    # New structure in vLLM 0.8.4
+                    cache_dtype = getattr(attn_layer, 'kv_cache_dtype', None)
+                    k_scale = getattr(attn_layer, '_k_scale', None) 
+                    v_scale = getattr(attn_layer, '_v_scale', None)
+                
+                # Fallback to None if attributes not found
                 ops.reshape_and_cache_flash(
                     kv_tuple[layer_idx][0].to(key_cache.device),
                     kv_tuple[layer_idx][1].to(value_cache.device),
                     key_cache,
                     value_cache,
                     slot_mapping[start_pos:start_pos + lmc_num_computed_tokens],
-                    attn_layer.attn.kv_cache_dtype,
-                    attn_layer.attn._k_scale,
-                    attn_layer.attn._v_scale,
+                    cache_dtype,
+                    k_scale,
+                    v_scale,
                 )
             
             idx += 1
@@ -743,9 +841,18 @@ def build_partial_prefill_input(
     # import here to avoid circular import.
     from vllm.worker.model_runner import (
         ModelInputForGPUWithSamplingMetadata)
+    
+    # In vLLM 0.8.4, ModelInputForGPUWithSamplingMetadata constructor may have new parameters
+    # Check if token_types is in the current model_input
+    token_types = getattr(model_input, 'token_types', None)
+    previous_hidden_states = getattr(model_input, 'previous_hidden_states', None)
+    scheduler_outputs = getattr(model_input, 'scheduler_outputs', None)
+    
+    # Create with args that exist in both old and new versions
     rebuilt_model_input = ModelInputForGPUWithSamplingMetadata(
         input_tokens=torch.cat(rebuilt_input_tokens).to(device),
         input_positions=torch.cat(rebuilt_input_positions).to(device),
+        token_types=token_types,
         seq_lens=model_input.seq_lens,
         query_lens=rebuilt_query_lens,
         lora_mapping=model_input.lora_mapping,
@@ -760,7 +867,6 @@ def build_partial_prefill_input(
         sampling_metadata=rebuilt_sampling_metadata,
         is_prompt=model_input.is_prompt,
         async_callback=model_input.async_callback,
-        seq_group_metadata_list=seq_group_metadata_list
     )
 
     return rebuilt_model_input

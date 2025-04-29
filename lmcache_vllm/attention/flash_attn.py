@@ -5,62 +5,81 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.attention.backends.abstract import AttentionType
+from vllm.attention.backends.abstract import AttentionType, AttentionLayer
+from vllm.attention.backends.flash_attn import FlashAttentionImpl, FlashAttentionMetadata
+from vllm.vllm_flash_attn import (flash_attn_varlen_func,
+                                flash_attn_with_kvcache)
+from vllm._custom_ops import reshape_and_cache
 
 
 def flash_attn_forward_for_cacheblend(
-    self,
+    impl_self: "FlashAttentionImpl",
+    layer: "AttentionLayer",
     query: torch.Tensor,
     key: torch.Tensor,
-    value: torch.Tensor,
+    value: torch.Tensor, 
     kv_cache: torch.Tensor,
     attn_metadata: "FlashAttentionMetadata",
-    k_scale: float = 1.0,
-    v_scale: float = 1.0,
-    attn_type: AttentionType = AttentionType.DECODER,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Forward pass with FlashAttention.
 
     Args:
-        query: shape = [num_tokens, num_heads * head_size]
-        key: shape = [num_tokens, num_kv_heads * head_size]
-        value: shape = [num_tokens, num_kv_heads * head_size]
+        query: shape = [num_tokens, num_heads, head_size]
+        key: shape = [num_tokens, num_kv_heads, head_size]
+        value: shape = [num_tokens, num_kv_heads, head_size]
+        output: shape = [num_tokens, num_heads, head_size]
         kv_cache = [2, num_blocks, block_size, num_kv_heads, head_size]
+            NOTE: kv_cache will be an empty tensor with shape [0]
+            for profiling run.
         attn_metadata: Metadata for attention.
-    Returns:
-        shape = [num_tokens, num_heads * head_size]
+    NOTE: It in-place updates the output tensor.
     """
-    if attn_type != AttentionType.DECODER:
-        raise NotImplementedError("Encoder self-attention and "
-                                  "encoder/decoder cross-attention "
-                                  "are not implemented for "
-                                  "FlashAttentionImpl")
+    # Query handling
+    if query.ndim == 3:
+        num_tokens = query.shape[0]
+        hidden_size = impl_self.num_heads * impl_self.head_size
+    elif query.ndim == 2:
+        num_tokens, hidden_size = query.shape
+        query = query.view(num_tokens, impl_self.num_heads, impl_self.head_size)
+    else:
+        raise ValueError(f"Unexpected query dimension: {query.ndim}")
 
-    # NOTE(woosuk): FlashAttention does not support FP8 KV cache.
-    assert k_scale == 1.0 and v_scale == 1.0, (
-        "key/v_scale is not supported in FlashAttention.")
+    # Key handling
+    if key.ndim != 3:
+        if key.ndim == 2:
+             key = key.view(num_tokens, impl_self.num_kv_heads, impl_self.head_size)
+        else:
+             raise ValueError(f"Unexpected key dimension: {key.ndim}")
 
-    num_tokens, hidden_size = query.shape
-    # Reshape the query, key, and value tensors.
-    query = query.view(-1, self.num_heads, self.head_size)
-    key = key.view(-1, self.num_kv_heads, self.head_size)
-    value = value.view(-1, self.num_kv_heads, self.head_size)
+    # Value handling
+    if value.ndim != 3:
+        if value.ndim == 2:
+             value = value.view(num_tokens, impl_self.num_kv_heads, impl_self.head_size)
+        else:
+            raise ValueError(f"Unexpected value dimension: {value.ndim}")
 
-    if kv_cache is not None:
+    # KV cache handling
+    key_cache = None
+    value_cache = None
+    if kv_cache.numel() > 0:  # Only process if not empty tensor
         key_cache = kv_cache[0]
         value_cache = kv_cache[1]
 
-        # Reshape the input keys and values and store them in the cache.
-        # If kv_cache is not provided, the new key and value tensors are
-        # not cached. This happens during the initial memory profiling run.
-        torch.ops.vllm.reshape_and_cache_flash(
+        # Set k_scale and v_scale to 1.0 as tensors
+        k_scale_tensor = torch.ones((), device=key_cache.device, dtype=key_cache.dtype)
+        v_scale_tensor = torch.ones((), device=value_cache.device, dtype=value_cache.dtype)
+
+        # Call reshape_and_cache with the correctly shaped tensors
+        reshape_and_cache(
             key,
             value,
-            kv_cache,
+            key_cache.unsqueeze(0),
+            value_cache.unsqueeze(0),
             attn_metadata.slot_mapping.flatten(),
-            self.kv_cache_dtype,
-            k_scale,
-            v_scale,
+            impl_self.kv_cache_dtype,
+            k_scale_tensor,
+            v_scale_tensor,
         )
 
     num_prefill_tokens = attn_metadata.num_prefill_tokens
@@ -77,12 +96,12 @@ def flash_attn_forward_for_cacheblend(
         prefill_meta = attn_metadata
         assert prefill_meta is not None
 
-        if (kv_cache is None or prefill_meta.block_tables is None
+        if (kv_cache.numel() == 0 or prefill_meta.block_tables is None
                 or prefill_meta.block_tables.numel() == 0):
             # normal attention
             # When block_tables are not filled, it means q and k are the
             # prompt, and they have the same length.
-            prefill_output = torch.ops.vllm.flash_attn_varlen_func(
+            prefill_output = flash_attn_varlen_func(
                 q=query,
                 k=key,
                 v=value,
@@ -90,17 +109,17 @@ def flash_attn_forward_for_cacheblend(
                 cu_seqlens_k=prefill_meta.seq_start_loc,
                 max_seqlen_q=prefill_meta.max_prefill_seq_len,
                 max_seqlen_k=prefill_meta.max_prefill_seq_len,
-                softmax_scale=self.scale,
+                softmax_scale=impl_self.scale,
                 causal=True,
-                window_size=self.sliding_window,
-                alibi_slopes=self.alibi_slopes,
-                softcap=self.logits_soft_cap,
+                window_size=impl_self.sliding_window,
+                alibi_slopes=impl_self.alibi_slopes,
+                softcap=impl_self.logits_soft_cap,
             )
         else:
             # prefix-enabled attention
             assert prefill_meta.seq_lens is not None
             max_seq_len = max(prefill_meta.seq_lens)
-            prefill_output = torch.ops.vllm.flash_attn_varlen_func(  # noqa
+            prefill_output = flash_attn_varlen_func(  # noqa
                 q=query,
                 k=key_cache,
                 v=value_cache,
@@ -108,17 +127,16 @@ def flash_attn_forward_for_cacheblend(
                 max_seqlen_q=prefill_meta.max_query_len,
                 cu_seqlens_k=prefill_meta.seq_start_loc,
                 max_seqlen_k=max_seq_len,
-                softmax_scale=self.scale,
+                softmax_scale=impl_self.scale,
                 causal=True,
-                alibi_slopes=self.alibi_slopes,
+                alibi_slopes=impl_self.alibi_slopes,
                 block_table=prefill_meta.block_tables,
-                softcap=self.logits_soft_cap,
+                softcap=impl_self.logits_soft_cap,
             )
 
         assert prefill_output is not None
         return prefill_output.view(num_prefill_tokens, hidden_size)
     # End of injection
-
 
     assert key.shape[0] == num_prefill_tokens + num_decode_tokens
     assert value.shape[0] == num_prefill_tokens + num_decode_tokens
@@ -138,30 +156,30 @@ def flash_attn_forward_for_cacheblend(
 
     if prefill_meta := attn_metadata.prefill_metadata:
         # Prompt run.
-        if (kv_cache is None or prefill_meta.block_tables is None
+        if (kv_cache.numel() == 0 or prefill_meta.block_tables is None
                 or prefill_meta.block_tables.numel() == 0):
             # normal attention
             # When block_tables are not filled, it means q and k are the
             # prompt, and they have the same length.
-            prefill_output = torch.ops.vllm.flash_attn_varlen_func(
+            prefill_output = flash_attn_varlen_func(
                 q=query,
                 k=key,
                 v=value,
-                cu_seqlens_q=prefill_meta.seq_start_loc,
+                cu_seqlens_q=prefill_meta.query_start_loc,
                 cu_seqlens_k=prefill_meta.seq_start_loc,
                 max_seqlen_q=prefill_meta.max_prefill_seq_len,
                 max_seqlen_k=prefill_meta.max_prefill_seq_len,
-                softmax_scale=self.scale,
+                softmax_scale=impl_self.scale,
                 causal=True,
-                window_size=self.sliding_window,
-                alibi_slopes=self.alibi_slopes,
-                softcap=self.logits_soft_cap,
+                window_size=impl_self.sliding_window,
+                alibi_slopes=impl_self.alibi_slopes,
+                softcap=impl_self.logits_soft_cap,
             )
         else:
             # prefix-enabled attention
             assert prefill_meta.seq_lens is not None
             max_seq_len = max(prefill_meta.seq_lens)
-            prefill_output = torch.ops.vllm.flash_attn_varlen_func(  # noqa
+            prefill_output = flash_attn_varlen_func(  # noqa
                 q=query,
                 k=key_cache,
                 v=value_cache,
@@ -169,26 +187,28 @@ def flash_attn_forward_for_cacheblend(
                 max_seqlen_q=prefill_meta.max_query_len,
                 cu_seqlens_k=prefill_meta.seq_start_loc,
                 max_seqlen_k=max_seq_len,
-                softmax_scale=self.scale,
+                softmax_scale=impl_self.scale,
                 causal=True,
-                alibi_slopes=self.alibi_slopes,
+                alibi_slopes=impl_self.alibi_slopes,
                 block_table=prefill_meta.block_tables,
-                softcap=self.logits_soft_cap,
+                softcap=impl_self.logits_soft_cap,
             )
 
     if decode_meta := attn_metadata.decode_metadata:
-        # Decoding run.
-        decode_output = torch.ops.vllm.flash_attn_with_kvcache(
-            decode_query.unsqueeze(1),
-            key_cache,
-            value_cache,
-            block_table=decode_meta.block_tables,
-            cache_seqlens=decode_meta.seq_lens_tensor,
-            softmax_scale=self.scale,
-            causal=True,
-            alibi_slopes=self.alibi_slopes,
-            softcap=self.logits_soft_cap,
-        ).squeeze(1)
+        # Only do decoding if we have a valid cache
+        if kv_cache.numel() > 0:
+            # Decoding run.
+            decode_output = flash_attn_with_kvcache(
+                decode_query.unsqueeze(1),
+                key_cache,
+                value_cache,
+                block_table=decode_meta.block_tables,
+                cache_seqlens=decode_meta.seq_lens_tensor,
+                softmax_scale=impl_self.scale,
+                causal=True,
+                alibi_slopes=impl_self.alibi_slopes,
+                softcap=impl_self.logits_soft_cap,
+            ).squeeze(1)
 
     if prefill_output is None:
         assert decode_output is not None
@@ -201,4 +221,8 @@ def flash_attn_forward_for_cacheblend(
 
 def inject_flash_attn():
     import vllm.attention.backends.flash_attn
-    vllm.attention.backends.flash_attn.FlashAttentionImpl.forward = flash_attn_forward_for_cacheblend
+    # Ensure the original forward exists before patching
+    if hasattr(vllm.attention.backends.flash_attn.FlashAttentionImpl, 'forward'):
+        vllm.attention.backends.flash_attn.FlashAttentionImpl.forward = flash_attn_forward_for_cacheblend
+    else:
+        print("Warning: vllm.attention.backends.flash_attn.FlashAttentionImpl.forward not found for patching.")

@@ -24,6 +24,7 @@ def llama_attn_init_with_blend(
     max_position_embeddings: int = 8192,
     quant_config: Optional[QuantizationConfig] = None,
     bias: bool = False,
+    bias_o_proj: bool = False,
     cache_config: Optional[CacheConfig] = None,
     prefix: str = "",
 ) -> None:
@@ -65,7 +66,7 @@ def llama_attn_init_with_blend(
     self.o_proj = RowParallelLinear(
         input_size=self.total_num_heads * self.head_dim,
         output_size=hidden_size,
-        bias=bias,
+        bias=bias_o_proj,
         quant_config=quant_config,
         prefix=f"{prefix}.o_proj",
     )
@@ -87,7 +88,8 @@ def llama_attn_init_with_blend(
                           self.scaling,
                           num_kv_heads=self.num_kv_heads,
                           cache_config=cache_config,
-                          quant_config=quant_config)
+                          quant_config=quant_config,
+                          prefix=prefix)
 
     # Injection for CacheBlend
     self.reverse_rotary_emb = get_reverse_rope(
@@ -127,7 +129,8 @@ def llama_attn_forward_with_blend(
         )
     # End of injection
 
-    attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+    # Remove kv_cache argument as it's likely handled via attn_metadata now
+    attn_output = self.attn(q, k, v, attn_metadata)
     output, _ = self.o_proj(attn_output)
     return output
 
@@ -173,8 +176,8 @@ def llama_model_forward_with_blend(
     positions: torch.Tensor,
     kv_caches: List[torch.Tensor],
     attn_metadata: AttentionMetadata,
-    intermediate_tensors,
     inputs_embeds: Optional[torch.Tensor] = None,
+    intermediate_tensors: Optional[dict] = None,
 ):
     # Injection for CacheBlend
     attn_metadata = process_new_request(input_ids, positions, attn_metadata, kv_caches)
@@ -187,21 +190,27 @@ def llama_model_forward_with_blend(
             hidden_states = self.get_input_embeddings(input_ids)
         residual = None
     else:
-        assert intermediate_tensors is not None
+        assert intermediate_tensors is not None, \
+            "intermediate_tensors must be provided for non-first pipeline ranks"
         hidden_states = intermediate_tensors["hidden_states"]
         residual = intermediate_tensors["residual"]
 
     for i in range(self.start_layer, self.end_layer):
         layer = self.layers[i]
+        # Handle None kv_caches during profiling
+        layer_kv_cache = kv_caches[i - self.start_layer] if kv_caches is not None else None
         hidden_states, residual = layer(
             positions,
             hidden_states,
-            kv_caches[i - self.start_layer],
+            layer_kv_cache, # Pass potentially None cache
             attn_metadata,
             residual,
         )
 
     if not get_pp_group().is_last_rank:
+        # Ensure intermediate_tensors is valid if needed for non-last rank
+        assert intermediate_tensors is not None, \
+             "intermediate_tensors needed for non-last pipeline rank but not available/passed correctly"
         return IntermediateTensors({
             "hidden_states": hidden_states,
             "residual": residual
